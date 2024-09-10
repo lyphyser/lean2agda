@@ -144,14 +144,19 @@ structure EraseConfig where
   omitImplicits: Bool := false
 
 structure Config extends EraseConfig where
-  options: Options := {}
+  options: Options
+  outputPath: FilePath
 
 structure DedupConfig where
   options: Options
   dedupPrefix: Name
 
-structure DedupState where
+structure ModuleDedupState where
   map: HashMap ExprStructEq Expr := {}
+  deriving Inhabited
+
+structure DedupState where
+  byModule: HashMap ModuleIdx ModuleDedupState
   numConsts: Nat := 0
   deriving Inhabited
 
@@ -579,6 +584,8 @@ genSubReader (Context) (EraseContext) toEraseContext
 genSubReader (Context) (DedupConfig) toDedupConfig
 
 structure ConstAnalysis where
+  moduleIdx: ModuleIdx
+
   numLevels: Nat := 0
   level2idx: HashMap Name (Fin numLevels) := HashMap.empty
 
@@ -594,6 +601,7 @@ structure ConstAnalysis where
 
 instance: Inhabited ConstAnalysis where
   default := {
+    moduleIdx := default,
     levelClauses := Vector.empty,
     numSingletonLevelClauses_le := Nat.le_refl _,
     singletonLevelClauses := Vector.empty
@@ -639,7 +647,7 @@ structure ModuleState where
   output: IO.FS.Stream
   deriving Inhabited
 
-def ModulesState := Option ModuleState
+def ModulesState := HashMap ModuleIdx ModuleState
   deriving Inhabited
 
 structure State where
@@ -1168,6 +1176,8 @@ partial def getOrComputeConstAnalysis [MonadStateOf GlobalAnalysis M] [MonadLift
   let env := ← readThe Environment
   let .some val := env.find? c | throw m!"constant not found: {c}"
 
+  let .some moduleIdx := env.getModuleIdxFor? c | throw m!"constant module idx not found: {c}"
+
   let levels := val.levelParams.toArray
   let numLevels := levels.size
   let level2idx := reverseHashMap levels id
@@ -1210,7 +1220,7 @@ partial def getOrComputeConstAnalysis [MonadStateOf GlobalAnalysis M] [MonadLift
     --h ▸ complexLevelClauses
   --let complexLevelClauses := cs
 
-  let constAnalysis: ConstAnalysis := {numLevels, level2idx, numLevelClauses, levelClauses, numSingletonLevelClauses, numSingletonLevelClauses_le, singletonLevelClauses}
+  let constAnalysis: ConstAnalysis := {moduleIdx, numLevels, level2idx, numLevelClauses, levelClauses, numSingletonLevelClauses, numSingletonLevelClauses_le, singletonLevelClauses}
   modify (λ ({consts}: GlobalAnalysis) ↦ {consts := consts.insert c constAnalysis})
   pure constAnalysis
 where
@@ -2095,17 +2105,26 @@ def outputModulePrelude [MonadReaderOf ModuleState M]: M Unit := do
   println "lone = lsuc lzero"
 
 def getOrOpenOutputModuleForConst [MonadStateOf ModulesState M] [MonadReaderOf Environment M] [MonadReaderOf Context M] [MonadLiftT IO M]
-  (_ci: ConstAnalysis): M ModuleState := do
-  match ← getThe ModulesState with
+  (ci: ConstAnalysis): M ModuleState := do
+  let moduleIdx := ci.moduleIdx
+  match (← getThe ModulesState).get? moduleIdx with
   | .some ms => ms
   | .none =>
-    let output ← (IO.getStdout : IO _)
-    let ms: ModuleState := {output}
+    let moduleName := (← readThe Environment).allImportedModuleNames[moduleIdx.toNat]!
+    let output ← match moduleName with
+    | .anonymous =>
+      (IO.getStdout : IO _)
+    | _ =>
+      let outputPath := (← readThe Context).outputPath
+      let dir := appendPrefixToPath outputPath moduleName
+      IO.FS.createDirAll dir
+      let path := appendSuffixFNameToPath dir moduleName
+      IO.FS.Stream.ofHandle <| ← IO.FS.Handle.mk path .writeNew
+    let ms := {output}
     ReaderT.run (r := ms) do
       outputModulePrelude
 
-    let mses: ModulesState := (some ms : ModulesState)
-    set mses
+    modifyThe ModulesState (·.insert moduleIdx ms)
     ms
 
 def afterDependencies (deps: Dependencies) (m: M Unit): TranslateOutput M :=
