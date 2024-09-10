@@ -41,6 +41,14 @@ def mapM {α β} (f : α → M β) (v : Vector α n) : M (Vector β n) := do
   toVector (← v.toArray.mapM f) n "elements produced by mapM on Vector"
 end Batteries.Vector
 
+def reverseHashMap {α} (a: Array α) {β} [BEq β] [Hashable β] (f: α → β) {γ} (g: Fin a.size → γ): HashMap β γ:=
+  Fin.foldl a.size (init := Std.HashMap.empty) λ m i ↦
+    m.insert (f a[i]) (g i)
+
+def reverseVector {α} (a: Array α) {n: Nat} (f: α → Fin n) {γ} (init: γ) (g: Fin a.size → γ): Vector γ n :=
+  Fin.foldl a.size (init := Vector.mkVector n init) λ m i ↦
+    m.set (f a[i]) (g i)
+
 instance [Repr α]: ToFormat α where
   format := repr
 
@@ -887,7 +895,7 @@ structure BoundLevels where
 
   -- not necessarily inverse of each other since they may be bound to other letters
   numLevels: Nat
-  idx2level: Vector (Option (Fin numLevels × Name)) numLevels
+  idx2level: Vector (Option Name) numLevels
   level2level: HashMap Name (Option (Fin numLevels × Name))
   nonzeroComplexClauses: HashSet (OrClause (Fin numLevels))
 
@@ -962,7 +970,7 @@ structure NormLevel where
   maxConst: Nat -- 0 if maxParams is empty
   maxParams: Array ParamLevel -- sorted by name, without duplicate names, if nonempty at least one add is 0
 
-def normalizeSimpLevel (l: SimpLevel): NormLevel :=
+def normalizeSimpLevelRaw (l: SimpLevel): NormLevel :=
   let ⟨maxParams, maxConst⟩ := go ⟨#[], 0⟩  0 l
   let nameEq: ParamLevel → ParamLevel → Bool := λ a b ↦ a.name == b.name
   let maxMerge: ParamLevel → ParamLevel → ParamLevel := λ a b ↦ {name := a.name, add := a.add.max b.add}
@@ -978,7 +986,6 @@ def normalizeSimpLevel (l: SimpLevel): NormLevel :=
       m.push ⟨x.1, x.2 - add⟩
     maxConst := maxConst - add
   }
-
 where
   go (s: (Array ParamLevel) × Nat) (add: Nat) (l: SimpLevel): (Array ParamLevel) × Nat :=
     match s, l with
@@ -989,6 +996,39 @@ where
       let s := go s add l1
       let s := go s add l2
       s
+
+def normalizeSimpLevel [MonadReaderOf BoundLevels M]
+  (l: SimpLevel): M NormLevel := do
+  let n := normalizeSimpLevelRaw l
+  let param2add := reverseHashMap n.maxParams (·.name) (n.maxParams[·].add)
+  let b ← readThe BoundLevels
+  let mut maxConst := n.maxConst
+
+  -- adjust maxConst to reflect knowledge about nonzeroComplexClauses
+  for c in b.nonzeroComplexClauses do
+    let minAdd := c.foldl (init := none) λ m l => match b.idx2level[l] with
+      | .none => panic!("zero level in nonzero clause!")
+      | .some n =>
+        some <| match param2add.get? n with
+        | .none => 0
+        | .some a =>
+          match m with
+          | .none => a + 1
+          | .some m => m.min (a + 1)
+    match minAdd with
+    | .none => ()
+    | .some minAdd => maxConst := maxConst.max minAdd
+
+  for n in b.idx2level.toArray do
+    match n with
+    | .none => ()
+    | .some n =>
+      match param2add.get? n with
+      | .none => ()
+      | .some a =>
+        maxConst := maxConst.max a
+
+  pure {n with maxConst}
 
 /- all levels known to be zero must have been removed -/
 def resolveSimplifiedLevelClause (b: BoundLevels)
@@ -1091,14 +1131,6 @@ structure ExprLevels where
   numLevels: Nat
   level2idx: HashMap Name (Fin numLevels)
 
-def reverseHashMap [BEq α] [Hashable α] (a: Array α) {β} (f: Fin a.size → β): HashMap α β:=
-  Fin.foldl a.size (init := Std.HashMap.empty) λ m i ↦
-    m.insert a[i] (f i)
-
-def reverseVector {n: Nat} (a: Array (Fin n)) {β} (init: β) (f: Fin a.size → β): Vector β n :=
-  Fin.foldl a.size (init := Vector.mkVector n init) λ m i ↦
-    m.set a[i] (f i)
-
 def collectLevelNonZeroClause (v: ExprLevels) [MonadStateOf (HashSet (OrClause (Fin v.numLevels))) M]
   (c: Option (OrClause (Fin v.numLevels))): M Unit := do
   match c with
@@ -1170,7 +1202,7 @@ partial def getOrComputeConstAnalysis [MonadStateOf GlobalAnalysis M] [MonadLift
 
   let levels := val.levelParams.toArray
   let numLevels := levels.size
-  let level2idx := reverseHashMap levels id
+  let level2idx := reverseHashMap levels id id
   let el: ExprLevels := {numLevels, level2idx}
 
   let r ←
@@ -1201,7 +1233,7 @@ partial def getOrComputeConstAnalysis [MonadStateOf GlobalAnalysis M] [MonadLift
     rw [← h]
     apply Nat.le_add_left
 
-  let singletonLevelClauses := reverseVector singles none (some ·)
+  let singletonLevelClauses := reverseVector singles id none (some ·)
   let singletonLevelClauses: Vector (Option (Fin numSingletonLevelClauses)) numLevels :=
     singletonLevelClauses
 
@@ -1716,17 +1748,19 @@ def bindLevelParamsWith [MonadLiftT IO M]
   {α: Type} (c: ConstAnalysis) (levelParams: Vector Name c.numLevels) (levelParamValues: Vector Name c.numLevels) (levelInstance: LevelInstance c.numLevelClauses) (m: ReaderT BoundLevels M α): M α := do
   let numLevels := c.numLevels
 
-  let idx2level := Fin.foldl c.numLevelClauses (init := Vector.ofFn λ i ↦ some ⟨i, levelParams[i]⟩) λ v i ↦
+  let idx2level := Fin.foldl c.numLevelClauses (init := Vector.ofFn λ i ↦ some levelParams[i]) λ v i ↦
     if levelInstance[i] = false then
       c.levelClauses[i].foldl (init := v) λ v l ↦ v.set l none
     else
       v
 
-  let level2level := reverseHashMap levelParamValues.toArray (λ i ↦
+  let level2level := reverseHashMap levelParamValues.toArray id (λ i ↦
     have h := by
       apply Fin.val_lt_of_le
       simp only [Vector.size_eq, numLevels, Nat.le_refl]
-    idx2level[i]'h
+    have h': levelParamValues.toArray.size = numLevels := by
+      exact levelParamValues.size_eq
+    (idx2level[i]'h).map (λ l ↦ ⟨h' ▸ i, l⟩)
   )
 
   let nonzeroComplexClauses := Fin.foldl (c.numLevelClauses - c.numSingletonLevelClauses) (init := Std.HashSet.empty) λ s i ↦
