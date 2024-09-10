@@ -2376,6 +2376,7 @@ def makeConstInstance (c: ConstAnalysis) (levelInstance: LevelInstance c.numLeve
   else
     some <| {constAnalysis := c, levelInstance, levelParams, idx2output, nonzeroClauses}
 
+@[noinline, nospecialize]
 def translateConstant'
   (c : Name) (levelInstance: GenLevelInstance): M (Option (Option (TranslateOutput M))) := do
   if (← getThe Visited).visitedConstants.contains (c, levelInstance) then
@@ -2421,6 +2422,7 @@ inductive QueueItem
 | const (c: Name) (levelInstance: GenLevelInstance)
 | out (m: M Unit)
 
+@[noinline, nospecialize]
 partial def translateConstantQueue (a: Array (QueueItem M)) (e: Option (TranslateOutput M)): M Unit := do
   let a := match e with
   | .some (deps, out) =>
@@ -2439,6 +2441,7 @@ partial def translateConstantQueue (a: Array (QueueItem M)) (e: Option (Translat
     m
     translateConstantQueue a none
 
+@[noinline, nospecialize]
 def translateConstant
   (c : Name) (levelInstance: GenLevelInstance): M (Option Unit) := do
   match ← translateConstant' c levelInstance with
@@ -2448,7 +2451,8 @@ def translateConstant
     translateConstantQueue #[] x
     some ()
 
-def translateConstantVariants
+@[noinline, nospecialize]
+partial def translateConstantVariants
   (c : Name): M Unit := do
   let constAnalysis ← getOrComputeConstAnalysis c
   StateT.run' (s := #[]) do
