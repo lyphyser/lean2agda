@@ -22,6 +22,27 @@ open Std (HashMap HashSet)
 
 deriving instance Hashable, Repr for ModuleIdx
 
+namespace Fin
+
+variable {M: Type u → Type v} [Monad M]
+
+/-- Folds over `Fin n` from the left: `foldl 3 f x = f (f (f x 0) 1) 2`. -/
+@[inline] def foldlM (n) (f : α → Fin n → M α) (init : α) : M α := loop init 0 where
+  /-- Inner loop for `Fin.foldl`. `Fin.foldl.loop n f x i = f (f (f x i) ...) (n-1)`  -/
+  loop (x : α) (i : Nat) : M α := do
+    if h : i < n then loop (← f x ⟨i, h⟩) (i+1) else pure x
+  termination_by n - i
+  decreasing_by decreasing_trivial_pre_omega
+
+/-- Folds over `Fin n` from the right: `foldr 3 f x = f 0 (f 1 (f 2 x))`. -/
+@[inline] def foldrM (n) (f : Fin n → α → M α) (init : α) : M α := loop ⟨n, Nat.le_refl n⟩ init where
+  /-- Inner loop for `Fin.foldr`. `Fin.foldr.loop n f i x = f 0 (f ... (f (i-1) x))`  -/
+  loop : {i // i ≤ n} → α → M α
+  | ⟨0, _⟩, x => pure x
+  | ⟨i+1, h⟩, x => do loop ⟨i, Nat.le_of_lt h⟩ (← f ⟨i, h⟩ x)
+
+end Fin
+
 namespace Std.HashSet
 @[inline]
 protected def ofArray [BEq α] [Hashable α] (as : Array α) : HashSet α :=
@@ -63,6 +84,10 @@ instance [MonadStateOf α M]: MonadReaderOf α M where
 abbrev OrClause (α) := Array α
 
 namespace OrClause
+def False: OrClause α := #[]
+def True?: Option (OrClause α) := none
+def False?: Option (OrClause α) := some False
+
 def toArray (c: OrClause α): Array α :=
   c
 
@@ -886,18 +911,23 @@ structure ConstInstance where
   constAnalysis: ConstAnalysis
   levelInstance: LevelInstance constAnalysis.numLevelClauses
   levelParams: Vector Name constAnalysis.numLevels
+  idx2output: Vector (Option Name) constAnalysis.numLevels
+  nonzeroClauses: Array (OrClause (Fin constAnalysis.numLevels))
   deriving Inhabited, Repr
 
+namespace ConstInstance
+abbrev numLevels (ci: ConstInstance) := ci.constAnalysis.numLevels
+end ConstInstance
+
+
 structure BoundLevels where
-  --constAnalysis: ConstAnalysis
+  constInstance: ConstInstance
+  input2idx: HashMap Name (Fin constInstance.constAnalysis.numLevels)
+
   --levelInstance: LevelInstance
 
 
   -- not necessarily inverse of each other since they may be bound to other letters
-  numLevels: Nat
-  idx2level: Vector (Option Name) numLevels
-  level2level: HashMap Name (Option (Fin numLevels × Name))
-  nonzeroComplexClauses: HashSet (OrClause (Fin numLevels))
 
 
   --levels: Vector (Option Name) numLevels
@@ -905,6 +935,13 @@ structure BoundLevels where
   --levelNonZero: Vector (Option Bool) numLevels
 
   deriving Inhabited, Repr
+
+namespace BoundLevels
+abbrev numLevels (b: BoundLevels) := b.constInstance.constAnalysis.numLevels
+
+def isAlwaysZero (b: BoundLevels) (l: Fin b.numLevels): Bool :=
+  b.constInstance.idx2output[l].isNone
+end BoundLevels
 
 structure ProcessedExpr where
   constInstance: ConstInstance
@@ -953,179 +990,152 @@ def intPrefix := if usebrokenNamespaceModules then "$" else ""
 
 def indentOneLevelSpaces := 2
 
-inductive SimpLevel
-  | zero : SimpLevel
-  | succ : SimpLevel → SimpLevel
-  | max : SimpLevel → SimpLevel → SimpLevel
-  | param : Name → SimpLevel
-  deriving Inhabited, BEq, Ord, Hashable
+structure MaxLevel (numLevels: Nat) where
+  const: Nat
+  params: Vector (Option Nat) numLevels
 
-structure ParamLevel where
-  name: Name
+structure NormLevel (numLevels: Nat) where
   add: Nat
-  deriving BEq, Ord
+  max: MaxLevel numLevels
 
-structure NormLevel where
-  add: Nat
-  maxConst: Nat -- 0 if maxParams is empty
-  maxParams: Array ParamLevel -- sorted by name, without duplicate names, if nonempty at least one add is 0
+namespace MaxLevel
+def maxParam {numLevels: Nat} (m: MaxLevel numLevels) (add: Nat) (l: Fin numLevels): MaxLevel numLevels :=
+  let {const, params} := m
+  let add := match params[l] with
+  | .none => add
+  | .some n => n.max add
+  {const, params := params.set l add}
 
-def normalizeSimpLevelRaw (l: SimpLevel): NormLevel :=
-  let ⟨maxParams, maxConst⟩ := go ⟨#[], 0⟩  0 l
-  let nameEq: ParamLevel → ParamLevel → Bool := λ a b ↦ a.name == b.name
-  let maxMerge: ParamLevel → ParamLevel → ParamLevel := λ a b ↦ {name := a.name, add := a.add.max b.add}
-  let maxParams := (maxParams.qsort (compare · · |>.isLT)).mergeAdjacentDups (eq := ⟨nameEq⟩) maxMerge
-  let add := maxParams.foldl (init := none) λ m x ↦
-    match m with
-    | .none => some x.2
-    | .some m => some <| m.min x.2
-  let add := add.getD maxConst
-  {
-    add,
-    maxParams := maxParams.foldl (init := #[]) λ m x ↦
-      m.push ⟨x.1, x.2 - add⟩
-    maxConst := maxConst - add
-  }
-where
-  go (s: (Array ParamLevel) × Nat) (add: Nat) (l: SimpLevel): (Array ParamLevel) × Nat :=
-    match s, l with
-    | (a, m), .zero => ⟨a, m.max add⟩
-    | (a, m), .param name => ⟨a.push {name, add}, m⟩
-    | s, .succ l => go s (add + 1) l
-    | s, .max l1 l2 =>
-      let s := go s add l1
-      let s := go s add l2
-      s
+def maxConst {numLevels: Nat} (m: MaxLevel numLevels)  (add: Nat): MaxLevel numLevels :=
+  let {const, params} := m
+  {const := const.max add, params}
 
-def normalizeSimpLevel [MonadReaderOf BoundLevels M]
-  (l: SimpLevel): M NormLevel := do
-  let n := normalizeSimpLevelRaw l
-  let param2add := reverseHashMap n.maxParams (·.name) (n.maxParams[·].add)
-  let b ← readThe BoundLevels
-  let mut maxConst := n.maxConst
+def maxMaxLevel {numLevels: Nat} (m: MaxLevel numLevels) (add: Nat) (ml: MaxLevel numLevels): MaxLevel numLevels :=
+  let {const, params} := m
+  let {const := bconst, params := bparams} := ml
+  let params := Fin.foldl numLevels (init := params) λ params i ↦
+    let v := match params[i], bparams[i] with
+    | .none, .none => none
+    | .some a, .none => some a
+    | .none, .some b => some (add + b)
+    | .some a, .some b => some <| a.max (add + b)
+    params.set i v
+  let const := const.max (add + bconst)
 
-  -- adjust maxConst to reflect knowledge about nonzeroComplexClauses
-  for c in b.nonzeroComplexClauses do
-    let minAdd := c.foldl (init := none) λ m l => match b.idx2level[l] with
-      | .none => panic!("zero level in nonzero clause!")
-      | .some n =>
-        some <| match param2add.get? n with
-        | .none => 0
-        | .some a =>
-          match m with
-          | .none => a + 1
-          | .some m => m.min (a + 1)
-    match minAdd with
-    | .none => ()
-    | .some minAdd => maxConst := maxConst.max minAdd
+  {const, params}
 
-  for n in b.idx2level.toArray do
-    match n with
-    | .none => ()
-    | .some n =>
-      match param2add.get? n with
-      | .none => ()
-      | .some a =>
-        maxConst := maxConst.max a
+def toClause {numLevels: Nat} (nl: MaxLevel numLevels): Option (OrClause (Fin numLevels)) :=
+  let {const, params} := nl
+  if const = 0 then
+    let b := Fin.foldl numLevels (init := OrClause.Builder.False?) λ b i ↦
+      match params[i] with
+      | .none => b
+      | .some add =>
+        if add = 0 then
+          OrClause.Builder.or? b i
+        else
+          OrClause.Builder.True?
+    OrClause.Builder.build? b
+  else
+    OrClause.True?
 
-  pure {n with maxConst}
+def normalize {numLevels: Nat} (ml: MaxLevel numLevels): NormLevel numLevels :=
+  let {params, const} := ml
+  let minMaxParam := params.toArray.foldl (init := none) λ m x ↦
+    match x with
+    | .none => m
+    | .some x =>
+      match m with
+      | .none => some (x, x)
+      | .some (minParam, maxParam) => some (minParam.min x, maxParam.max x)
 
-/- all levels known to be zero must have been removed -/
-def resolveSimplifiedLevelClause (b: BoundLevels)
-    (c: Option (OrClause (Fin b.numLevels))): M Bool := do
+  match minMaxParam with
+  | .some (add, maxParam) =>
+    {
+      add,
+      max := {
+        params := params.map (·.map (· - add))
+        const := if const > maxParam then const - add else 0
+      }
+    }
+  | .none =>
+    {
+      add := const,
+      max := {params, const := 0}
+    }
+end MaxLevel
+
+namespace NormLevel
+def toClause {numLevels: Nat} (nl: NormLevel numLevels): Option (OrClause (Fin numLevels)) :=
+  let {add, max} := nl
+  if add = 0 then
+    max.toClause
+  else
+    OrClause.True?
+end NormLevel
+
+/- resolveLevel and applyNonZeroClauses actually do all the work -/
+def resolveSimplifiedLevelClause (ci: ConstInstance)
+    (c: Option (OrClause (Fin ci.numLevels))): M Bool := do
   match c with
   | .none => true
   | .some #[] => false
-  | .some #[l] =>
-    if b.idx2level[l].isSome then
-      true
-    else
-      throw m!"dependent singleton const level clause {l} is supposed to be nonzero, but it's actually zero!"
   | .some c =>
-    if b.nonzeroComplexClauses.contains c then
-      true
-    else
-      throw m!"Unable to decide whether dependent const level clause {c.toArray.map (·.val)} is always nonzero or zero: level clause generation is buggy!"
+    throw m!"Unable to decide whether dependent const level clause {c.toArray.map (·.val)} is always nonzero or zero: level clause generation or level resolution is buggy!"
 
-def resolveLevelUnchecked [MonadReaderOf BoundLevels M]
-    : Level → M SimpLevel
-| .zero => do
-  pure .zero
-| .succ l => do
-  pure <| .succ (← resolveLevelUnchecked l)
-| .param n => do
-  let boundLevels ← read
-  if let .some n := boundLevels.level2level.get? n then
-    pure <| match n with
-    | .none => .zero
-    | .some (_li, n) => .param n
-  else
-    throw m!"unbound level variable {n}"
-| .max l1 l2 => do
-  pure <| match ← resolveLevelUnchecked l1, ← resolveLevelUnchecked l2 with
-  | s1, .zero => s1
-  | .zero, s2 => s2
-  | s1, s2 => .max s1 s2
-| .imax l1 l2 => do
-  match ← resolveLevelUnchecked l2 with
-  | .zero => pure .zero
-  | s2 =>
-    -- here we assume that if we can't prove l2 is zero, it must always be non-zero, due to how we constructed clauses
-    pure <| match ← resolveLevelUnchecked l1 with
-    | .zero => s2
-    | s1 => .max s1 s2
-| .mvar _ => throw m!"unexpected mvar in level"
+/- apply the fact that e.g. if we know that u OR v != 0, then max(u + 3, v + 6, ...) >= 4, so rewrite the const in the max accordingly -/
+def applyNonZeroClauses
+  (ci: ConstInstance) (ml: MaxLevel ci.numLevels): MaxLevel ci.numLevels :=
+  let {params, const} := ml
 
-def resolveLevelWithClause (b: BoundLevels)
-    (l: Level): M (SimpLevel × Option (OrClause (Fin b.numLevels))) :=
-  goBuild b l
+  let const := ci.nonzeroClauses.foldl (init := const) λ const c ↦
+    let minAdd := c.foldl (init := none) λ m l =>
+      some <| match params[l] with
+      | .none => 0
+      | .some a =>
+        match m with
+        | .none => a + 1
+        | .some m => m.min (a + 1)
+    match minAdd with
+    | .none => (panic! "nonzero complex clause is empty!") + const
+    | .some minAdd => const.max minAdd
+  {params, const}
+
+def resolveLevel (b: BoundLevels)
+    (l: Level): M (NormLevel b.numLevels) := do
+  MaxLevel.normalize <| ← goBuild l
 where
-  goBuild (b: BoundLevels) (l: Level): M (SimpLevel × Option (OrClause (Fin b.numLevels))) := do
-    let ⟨s, b⟩ ← StateT.run (s := OrClause.Builder.False?) (m := M) <|
-      go b l
-    pure ⟨s, OrClause.Builder.build? b⟩
-  go (b: BoundLevels)
-    (l: Level): StateT (Option (OrClause.Builder (Fin b.numLevels))) M SimpLevel :=
+  goBuild (l: Level): M (MaxLevel b.numLevels) := do
+    let ⟨_, ml⟩ ← StateT.run (s := {const := 0, params := Vector.mkVector b.numLevels none}) (m := M) <|
+      go 0 l
+    pure <| applyNonZeroClauses b.constInstance ml
+  go (add: Nat)
+    (l: Level): StateT (MaxLevel b.numLevels) M Unit :=
     match l with
     | .zero => do
-      pure .zero
+      modify (·.maxConst add)
     | .succ l => do
-      set (OrClause.Builder.True?: Option (OrClause.Builder (Fin b.numLevels)))
-      pure <| .succ (← go b l)
+      pure <| (← go (add + 1) l)
     | .param n => do
-      if let .some n := b.level2level.get? n then
-        match n with
-        | .none =>
-          pure .zero
-        | .some ⟨li, n⟩ =>
-          modify (OrClause.Builder.or? · li)
-          pure <| .param n
+      if let .some l := b.input2idx.get? n then
+        if b.isAlwaysZero l then
+          modify (·.maxConst add)
+        else
+          modify (·.maxParam add l)
       else
         throw m!"unbound level variable {n}"
     | .max l1 l2 => do
-      pure <| match ← go b l1, ← go b l2 with
-      | s1, .zero => s1
-      | .zero, s2 => s2
-      | s1, s2 => .max s1 s2
+      go add l1
+      go add l2
     | .imax l1 l2 => do
-      let ⟨s2, c2⟩ ← goBuild b l2
-      match s2 with
-      | .zero => pure .zero
-      | s2 =>
-        modify (OrClause.Builder.orClause?? · c2)
-        match c2 with
-        | .none => ()
-        | .some c2 =>
-          if (← resolveSimplifiedLevelClause b c2) == false then
-            throw m!"bug: simplified level clause is zero, but SimpLevel is not zero!"
-        pure <| match ← go b l1 with
-        | .zero => s2
-        | s1 => .max s1 s2
-    | .mvar _ => throw m!"unexpected mvar in level"
+      let m2 ← goBuild l2
 
-def resolveLevel [MonadReaderOf BoundLevels M]
-    (l: Level): M SimpLevel := do
-  pure (← resolveLevelWithClause (← readThe BoundLevels) l).1
+      if (← resolveSimplifiedLevelClause b.constInstance m2.toClause) then
+        modify (·.maxMaxLevel add m2)
+        go add l1
+      else
+        modify (·.maxConst add)
+    | .mvar _ => throw m!"unexpected mvar in level"
 
 structure ExprLevels where
   numLevels: Nat
@@ -1609,15 +1619,24 @@ def lconst: Nat → PFormat
 | .succ n => ladd n (token "lone")
 
 def formatLevel [MonadReaderOf Context M]
-  (l : NormLevel): M PFormat := do
-  match l with
-  | {add, maxParams := #[], maxConst} => lconst (add + maxConst)
-  | {add, maxParams, maxConst} =>
-    let es := if maxConst != 0 then
-      #[lconst maxConst]
+  (ci: ConstInstance) (nl : NormLevel ci.numLevels): M PFormat := do
+  let {add, max := {const, params}} := nl
+
+  if params.toArray.all (·.isNone) then
+    lconst (add + const)
+  else
+    let es := if const != 0 then
+      #[lconst const]
     else
       #[]
-    let es ← pure <| es.append <| ← maxParams.mapM λ x ↦ do pure <| ladd x.add <| ← lparam x.name
+    let es ← pure <| es.append <| ← Fin.foldlM ci.numLevels (init := #[]) λ ps l => do
+      match params[l] with
+      | .none =>
+        ps
+      | .some padd =>
+        ps.push <| ← do match ci.idx2output[l] with
+        | .none => lconst <| (panic! "zero level param in normalized level!") + padd
+        | .some n => pure <| ladd padd <| ← lparam n
 
     ladd add (lmax es.toList)
 where
@@ -1745,35 +1764,13 @@ def formatLevelParams [MonadStateOf ExprState M] [MonadReaderOf Context M]
   pure $ formatParams params
 
 def bindLevelParamsWith [MonadLiftT IO M]
-  {α: Type} (c: ConstAnalysis) (levelParams: Vector Name c.numLevels) (levelParamValues: Vector Name c.numLevels) (levelInstance: LevelInstance c.numLevelClauses) (m: ReaderT BoundLevels M α): M α := do
-  let numLevels := c.numLevels
+  {α: Type} (ci: ConstInstance) (levelParamValues: Vector Name ci.numLevels) (m: ReaderT BoundLevels M α): M α := do
 
-  let idx2level := Fin.foldl c.numLevelClauses (init := Vector.ofFn λ i ↦ some levelParams[i]) λ v i ↦
-    if levelInstance[i] = false then
-      c.levelClauses[i].foldl (init := v) λ v l ↦ v.set l none
-    else
-      v
+  let h: levelParamValues.toArray.size = ci.constAnalysis.numLevels := by
+    exact levelParamValues.size_eq
+  let input2idx := h ▸ reverseHashMap levelParamValues.toArray id id
 
-  let level2level := reverseHashMap levelParamValues.toArray id (λ i ↦
-    have h := by
-      apply Fin.val_lt_of_le
-      simp only [Vector.size_eq, numLevels, Nat.le_refl]
-    have h': levelParamValues.toArray.size = numLevels := by
-      exact levelParamValues.size_eq
-    (idx2level[i]'h).map (λ l ↦ ⟨h' ▸ i, l⟩)
-  )
-
-  let nonzeroComplexClauses := Fin.foldl (c.numLevelClauses - c.numSingletonLevelClauses) (init := Std.HashSet.empty) λ s i ↦
-    let i' := i.addNat c.numSingletonLevelClauses
-    let h := by
-      apply Fin.val_lt_of_le
-      simp only [c.numSingletonLevelClauses_le, Nat.sub_add_cancel, Nat.le_refl]
-    let cl := c.levelClauses[i']'h
-    s.insert <| cl.filter (idx2level[·].isSome)
-
-  --nonzeroComplexClauses: HashSet (OrClause (Fin numLevels))
-
-  let r: BoundLevels := {numLevels, idx2level, level2level, nonzeroComplexClauses}
+  let r: BoundLevels := {constInstance := ci, input2idx}
   --traceComment s!"BoundLevels: {repr r}"
   ReaderT.run (r := r) do
     m
@@ -1784,8 +1781,7 @@ def numLevels (e: ProcessedExpr) := e.constInstance.constAnalysis.numLevels
 -- TODO: probably move into processExprAnd
 def bindLevelParams [MonadLiftT IO M]
   {α: Type} (e: ProcessedExpr) (m: ReaderT BoundLevels M α): M α := do
-  let ci := e.constInstance
-  bindLevelParamsWith ci.constAnalysis ci.levelParams e.erased.levelParams ci.levelInstance m
+  bindLevelParamsWith e.constInstance e.erased.levelParams m
 end ProcessedExpr
 
 section FormatExpr
@@ -1800,10 +1796,10 @@ abbrev FormatT (M: Type → Type) [Monad M] := ExceptT MessageData <|
 def formatConst (n: Name) (us: Array Level) (f: String → String) (withLevels: Bool): M PFormat := do
   let constAnalysis ← getOrComputeConstAnalysis n
   let boundLevels ← readThe BoundLevels
-  let ucs ← us.mapM (resolveLevelWithClause boundLevels)
+  let ucs ← us.mapM (resolveLevel boundLevels)
   let ucs ← toVector ucs constAnalysis.numLevels "levels in const usage expression"
-  let ccs := constAnalysis.levelClauses.map (OrClause.subst · (ucs.map (·.2)))
-  let levelInstance ← ccs.mapM (resolveSimplifiedLevelClause boundLevels)
+  let ccs := constAnalysis.levelClauses.map (OrClause.subst · (ucs.map (·.toClause)))
+  let levelInstance ← ccs.mapM (resolveSimplifiedLevelClause boundLevels.constInstance)
   let ucs := specializeLevelParams constAnalysis levelInstance ucs
 
   addDependency n levelInstance.toArray
@@ -1811,7 +1807,7 @@ def formatConst (n: Name) (us: Array Level) (f: String → String) (withLevels: 
   let c := token (f (← stringifyGlobalName n levelInstance))
 
   if withLevels && !us.isEmpty then
-    let levels: List PFormat ← (← ucs.mapM <| fun (s, _c) => do pure <| encloseWith levelBinderSeps (← formatLevel (normalizeSimpLevel s))).toList
+    let levels: List PFormat := (← ucs.mapM <| fun nl => do pure <| encloseWith levelBinderSeps (← formatLevel boundLevels.constInstance nl)).toList
     app c levels
   else
     c
@@ -1870,9 +1866,11 @@ where
       let i := a.size - 1 - i
       let v := a[i]!
       token v
-    | .sort l => match normalizeSimpLevel (← resolveLevel l) with
-      | l@{add := n, maxParams := #[], maxConst := 0} =>
-        match n with
+    | .sort l =>
+      let boundLevels ← readThe BoundLevels
+      let {add, max := {const, params}} := ← resolveLevel boundLevels l
+      if params.toArray.all (·.isNone) then
+        match add with
         | 0 => token "Prop"
         | 1 => token "Set₁"
         | 2 => token "Set₂"
@@ -1884,10 +1882,12 @@ where
         | 8 => token "Set₈"
         | 9 => token "Set₉"
         | .succ n => app (token "Type") [lconst n]
-      | {add := .succ addp, maxParams, maxConst} =>
-        app (token "Type") [← formatLevel {add := addp, maxParams, maxConst}]
-      | l =>
-        app (token "Set") [← formatLevel l]
+      else
+        match add with
+        | .succ addp =>
+          app (token "Type") [← formatLevel boundLevels.constInstance {add := addp, max := {const, params}}]
+        | .zero =>
+          app (token "Set") [← formatLevel boundLevels.constInstance {add, max := {const, params}}]
     | .const n us =>
       formatConst n us.toArray id true
     | .app f e =>
@@ -2355,30 +2355,45 @@ def translateDef
 
   translateFun constInstance deps m s n p ty cases
 
-def translateConstant'
-  (c : Name) (levelInstance: GenLevelInstance): M (Option (TranslateOutput M)) := do
-  if (← getThe Visited).visitedConstants.contains (c, levelInstance) then
-    return none
-  modifyThe Visited fun st => { st with visitedConstants := st.visitedConstants.insert (c, levelInstance) }
+def makeConstInstance (c: ConstAnalysis) (levelInstance: LevelInstance c.numLevelClauses) (levelParams: Vector Name c.numLevels): Option ConstInstance :=
+  let idx2output := Fin.foldl c.numLevelClauses (init := Vector.ofFn λ i ↦ some levelParams[i]) λ v i ↦
+    if levelInstance[i] = false then
+      c.levelClauses[i].foldl (init := v) λ v l ↦ v.set l none
+    else
+      v
 
-  try
-    pure <| some <| ← translate c
-  catch e =>
-    throw m!"translating constant {c}\n{e}"
-where
-  translate (c: Name):= do
+  let nonzeroClauses := Fin.foldl c.numLevelClauses (init := #[]) λ s i ↦
+    if levelInstance[i] = true then
+      let cl := c.levelClauses[i]
+      s.push <| cl.filter (idx2output[·].isSome)
+    else
+      s
+
+  let nonzeroClauses := nonzeroClauses.sortDedup
+
+  if nonzeroClauses.contains #[] then
+    none
+  else
+    some <| {constAnalysis := c, levelInstance, levelParams, idx2output, nonzeroClauses}
+
+def translateConstant'
+  (c : Name) (levelInstance: GenLevelInstance): M (Option (Option (TranslateOutput M))) := do
+  if (← getThe Visited).visitedConstants.contains (c, levelInstance) then
+    return some none
+
+  let r ← try
     let env := ← getThe Environment
     let .some val := env.find? c | throw m!"not found"
 
     let constAnalysis ← getOrComputeConstAnalysis c
     let levelInstance ← toVector levelInstance constAnalysis.numLevelClauses "level kinds in level instance for constant to be translated"
     let levelParams ← toVector val.levelParams.toArray constAnalysis.numLevels "level parameters in constant declaration compared to analysis"
-    let (ns, n) ← declarationName c levelInstance
-
-    let constInstance: ConstInstance := {constAnalysis, levelInstance, levelParams}
+    let .some constInstance := makeConstInstance constAnalysis levelInstance levelParams | return none
     --comment s!"const instance for {c}: {repr constInstance}"
 
-    match val with
+    let (ns, n) ← declarationName c levelInstance
+
+    some <| some <| ← match val with
     | .axiomInfo val => do
       translateDef c constInstance ns "axiom" n val.toConstantVal none
     | .defnInfo val => do
@@ -2392,32 +2407,46 @@ where
     | .inductInfo val => do
       translateInductive c constInstance ns n val
     | .ctorInfo _ =>
-      pure default
+      pure (#[], pure ())
     | .recInfo val =>
       translateRecursor c constInstance ns n val
+  catch e =>
+    throw m!"translating constant {c}\n{e}"
+
+  modifyThe Visited λ ({visitedConstants}) ↦ {visitedConstants := visitedConstants.insert (c, levelInstance) }
+  r
 
 variable (M) in
 inductive QueueItem
 | const (c: Name) (levelInstance: GenLevelInstance)
 | out (m: M Unit)
 
-partial def translateConstantQueue (a: Array (QueueItem M)): M Unit := do
+partial def translateConstantQueue (a: Array (QueueItem M)) (e: Option (TranslateOutput M)): M Unit := do
+  let a := match e with
+  | .some (deps, out) =>
+    let depsItems := deps.map fun (n, levelInstance) => QueueItem.const n levelInstance
+    (a.push (.out out)).append depsItems.reverse
+  | .none => a
+
   let item := a.back?
   match item, a.pop with
   | .none, _ => ()
   | .some (.const c levelInstance), a =>
-    translateConstantQueue <| match ← translateConstant' c levelInstance with
-    | .some (deps, out) =>
-      let depsItems := deps.map fun (n, levelInstance) => .const n levelInstance
-      (a.push (.out out)).append depsItems.reverse
-    | .none => a
+    match ← translateConstant' c levelInstance with
+    | .some e => translateConstantQueue a e
+    | .none => throw m!"attempted to reference constant {c} with impossible level instance {levelInstance}!"
   | .some (.out m), a =>
     m
-    translateConstantQueue a
+    translateConstantQueue a none
 
 def translateConstant
-  (c : Name) (levelInstance: GenLevelInstance): M Unit := do
-  translateConstantQueue #[.const c levelInstance]
+  (c : Name) (levelInstance: GenLevelInstance): M (Option Unit) := do
+  match ← translateConstant' c levelInstance with
+  | .none =>
+    pure none
+  | .some x =>
+    translateConstantQueue #[] x
+    some ()
 
 def translateConstantVariants
   (c : Name): M Unit := do
@@ -2427,10 +2456,11 @@ def translateConstantVariants
 where
   go (n: Nat): StateT GenLevelInstance M Unit := do
     match n with
-    | .zero => translateConstant c (← getThe GenLevelInstance)
+    | .zero =>
+      let _ ← translateConstant c (← getThe GenLevelInstance)
     | .succ n =>
-      #[false, true].forM fun sk => do
-        modifyThe GenLevelInstance (·.push sk)
+      #[false, true].forM fun b => do
+        modifyThe GenLevelInstance (·.push b)
         go n
         modifyThe GenLevelInstance (·.pop)
 
