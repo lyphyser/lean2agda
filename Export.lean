@@ -1,10 +1,3 @@
--- fix remaining compilation errors from LevelKinds -> LevelInstance change
--- compute the LevelInstance for the constructor pattern in recursor properly (by reusing the .const code?)
--- check that it still works
--- check that places where levelParams was [] and changed still work
--- maybe put processExprAnd and bindLevelParams together
--- split into multiple files
-
 import Pretty
 
 import Lean
@@ -949,8 +942,24 @@ structure ProcessedExpr where
   deriving Inhabited
   --levelKinds: Array LevelKind := {}
 
+namespace ProcessedExpr
+abbrev numLevels (e: ProcessedExpr) := e.constInstance.constAnalysis.numLevels
+end ProcessedExpr
+
+def bindLevelParamsWith [MonadLiftT IO M]
+  {α: Type} (ci: ConstInstance) (levelParamValues: Vector Name ci.numLevels) (m: ReaderT BoundLevels M α): M α := do
+
+  let h: levelParamValues.toArray.size = ci.constAnalysis.numLevels := by
+    exact levelParamValues.size_eq
+  let input2idx := h ▸ reverseHashMap levelParamValues.toArray id id
+
+  let r: BoundLevels := {constInstance := ci, input2idx}
+  --traceComment s!"BoundLevels: {repr r}"
+  ReaderT.run (r := r) do
+    m
+
 def processExprAnd [MonadReaderOf Context M] [MonadStateOf Environment M] [MonadLiftT IO M]
-    (constInstance: ConstInstance) (levelParams: Vector Name constInstance.constAnalysis.numLevels) (e : DedupedExpr) (keep: Nat) (f: ProcessedExpr → ReaderT AnnotationData (StateT ExprState M) α): M α := do
+    (constInstance: ConstInstance) (levelParams: Vector Name constInstance.constAnalysis.numLevels) (e : DedupedExpr) (keep: Nat) (f: ProcessedExpr → ReaderT BoundLevels (ReaderT AnnotationData (StateT ExprState M)) α): M α := do
   let e := e.deduped
 
   have: MonadStateOf Unit M := unitStateOf
@@ -965,7 +974,8 @@ def processExprAnd [MonadReaderOf Context M] [MonadStateOf Environment M] [Monad
     }
   StateT.run' (s := ({} : ExprState)) do
     ReaderT.run (r := annotationData) do
-      f e
+      bindLevelParamsWith e.constInstance e.erased.levelParams do
+        f e
 
 -- not including space or @.(){};_
 -- TODO: handle identifiers conflicting with Agda defs
@@ -1763,26 +1773,6 @@ def formatLevelParams [MonadStateOf ExprState M] [MonadReaderOf Context M]
   let (params, _) <- extractLevelParams l l.length
   pure $ formatParams params
 
-def bindLevelParamsWith [MonadLiftT IO M]
-  {α: Type} (ci: ConstInstance) (levelParamValues: Vector Name ci.numLevels) (m: ReaderT BoundLevels M α): M α := do
-
-  let h: levelParamValues.toArray.size = ci.constAnalysis.numLevels := by
-    exact levelParamValues.size_eq
-  let input2idx := h ▸ reverseHashMap levelParamValues.toArray id id
-
-  let r: BoundLevels := {constInstance := ci, input2idx}
-  --traceComment s!"BoundLevels: {repr r}"
-  ReaderT.run (r := r) do
-    m
-
-namespace ProcessedExpr
-def numLevels (e: ProcessedExpr) := e.constInstance.constAnalysis.numLevels
-
--- TODO: probably move into processExprAnd
-def bindLevelParams [MonadLiftT IO M]
-  {α: Type} (e: ProcessedExpr) (m: ReaderT BoundLevels M α): M α := do
-  bindLevelParamsWith e.constInstance e.erased.levelParams m
-end ProcessedExpr
 
 section FormatExpr
 variable
@@ -1812,7 +1802,6 @@ def formatConst (n: Name) (us: Array Level) (f: String → String) (withLevels: 
   else
     c
 
--- must be inside bindLevelParams and bind for outer params
 def formatExprInner
   (mdatas: List MData) (e : Expr) : M PFormat := do
   try
@@ -1941,39 +1930,36 @@ where
         pure (Array.empty, ← f ms e)
 
 def formatParamsAndHandleExpr
-    [Inhabited α] (e: ProcessedExpr) (n: Nat) (strict: Bool) (f: List Name → List MData → Expr → ReaderT BoundLevels M α): M ((Array ((Option BinderInfo) × String × PFormat)) × α) := do
-  e.bindLevelParams do
-    if n < e.numLevels then
-      throw m!"{"" ++ panic! s!"partial extraction of level params: {n} < {e.numLevels}!!!"} partial extraction of level params: {n} < {e.numLevels}!!!"
+    [Inhabited α] (e: ProcessedExpr) (n: Nat) (strict: Bool) (f: List Name → List MData → Expr → M α): M ((Array ((Option BinderInfo) × String × PFormat)) × α) := do
+  if n < e.numLevels then
+    throw m!"{"" ++ panic! s!"partial extraction of level params: {n} < {e.numLevels}!!!"} partial extraction of level params: {n} < {e.numLevels}!!!"
 
-      let (extractedLevelParams, levelParams) <- extractLevelParams e.erased.levelParams.toList n
-      pure (extractedLevelParams, ← f levelParams [] e.erased.expr)
-    else
-      let levelParams := specializeLevelParams e.constInstance.constAnalysis e.constInstance.levelInstance e.erased.levelParams
-      let (extractedLevelParams, _) <- extractLevelParams levelParams.toList levelParams.size
-      let (typeParams, expr) ← formatTypeParamsAndHandleExpr e.erased.expr (n - e.erased.levelParams.size) strict (f [])
-      pure (extractedLevelParams ++ typeParams, expr)
+    let (extractedLevelParams, levelParams) <- extractLevelParams e.erased.levelParams.toList n
+    pure (extractedLevelParams, ← f levelParams [] e.erased.expr)
+  else
+    let levelParams := specializeLevelParams e.constInstance.constAnalysis e.constInstance.levelInstance e.erased.levelParams
+    let (extractedLevelParams, _) <- extractLevelParams levelParams.toList levelParams.size
+    let (typeParams, expr) ← formatTypeParamsAndHandleExpr e.erased.expr (n - e.erased.levelParams.size) strict (f [])
+    pure (extractedLevelParams ++ typeParams, expr)
 
 def formatParamsAndProcessedExpr
     (e: ProcessedExpr) (n: Nat): M ((Array ((Option BinderInfo) × String × PFormat)) × PFormat) :=
-  e.bindLevelParams do
-    formatParamsAndHandleExpr e n true (formatExprInnerWithLevelParams · · ·)
+  formatParamsAndHandleExpr e n true (formatExprInnerWithLevelParams · · ·)
 
 def formatArgsAndHandleExpr
-    (e: ProcessedExpr) (f: List MData → Expr → Nat → ReaderT BoundLevels M ((Array ((Option BinderInfo) × String)) × PFormat)): M ((Array ((Option BinderInfo) × String)) × PFormat) := do
-  e.bindLevelParams do
-    let levelParams := specializeLevelParams e.constInstance.constAnalysis e.constInstance.levelInstance e.erased.levelParams
-    let (a, b) <- goLevels levelParams.toList e.erased.expr
-    pure (a.reverse, b)
+    (e: ProcessedExpr) (f: List MData → Expr → Nat → M ((Array ((Option BinderInfo) × String)) × PFormat)): M ((Array ((Option BinderInfo) × String)) × PFormat) := do
+  let levelParams := specializeLevelParams e.constInstance.constAnalysis e.constInstance.levelInstance e.erased.levelParams
+  let (a, b) <- goLevels levelParams.toList e.erased.expr
+  pure (a.reverse, b)
 where
-  goLevels (levels: List Name) (e: Expr) : ReaderT BoundLevels M ((Array ((Option BinderInfo) × String)) × PFormat) :=
+  goLevels (levels: List Name) (e: Expr) : M ((Array ((Option BinderInfo) × String)) × PFormat) :=
     match levels with
     | n :: levels => do
       let (n, (a, b)) <- bindIf true n (goLevels levels e)
       pure (a.push (none, n), b)
     | [] => goExpr [] e 0
 
-  goExpr (mdatas: List MData) (e: Expr) (depth: Nat): ReaderT BoundLevels M ((Array ((Option BinderInfo) × String)) × PFormat) := do
+  goExpr (mdatas: List MData) (e: Expr) (depth: Nat): M ((Array ((Option BinderInfo) × String)) × PFormat) := do
     match e with
     | .mdata m b => goExpr (m :: mdatas) b depth
     | .lam n _d b bi =>
@@ -2182,9 +2168,8 @@ def translateInductive (c: Name) (constInstance: ConstInstance) (ns: Array Strin
       let numCtorParams := (ctor.levelParams.length + ctor.numParams + ctor.numFields)
       let ctorLevelParams ← toVector ctor.levelParams.toArray constInstance.constAnalysis.numLevels "level parameters in inductive ctor compared to inductive type"
       let (fields, _) <- processExprAnd constInstance ctorLevelParams ctorType numCtorParams fun e => do
-        e.bindLevelParams do
-          substTypeParams [] e.erased.expr typeValues fun _ms e => do
-            formatTypeParamsAndHandleExpr e ctor.numFields true (λ _ _ => pure ())
+        substTypeParams [] e.erased.expr typeValues fun _ms e => do
+          formatTypeParamsAndHandleExpr e ctor.numFields true (λ _ _ => pure ())
 
       -- Agda actually supports implicit and typeclass fields, no need to exclude them!
       --pure $ if fields.all (fun ⟨bi, _, _⟩ => bi == some BinderInfo.default) then
@@ -2222,8 +2207,7 @@ def translateInductive (c: Name) (constInstance: ConstInstance) (ns: Array Strin
       ctorTypes.mapM fun ctorType => do
         -- levelParams was []
         processExprAnd constInstance constInstance.levelParams ctorType 0 fun e => do
-          e.bindLevelParams do
-            substTypeParams [] e.erased.expr typeValues formatExprInner
+          substTypeParams [] e.erased.expr typeValues formatExprInner
 
     pure <| produceOutput constInstance.constAnalysis deps ns do
       nlprintln s!"--inductive {val.levelParams.length} {val.numParams}->{fixedNumParams} {val.numIndices} {typeParams.size}"
@@ -2246,9 +2230,8 @@ def translateFun
     (deps: Dependencies) (ns: Array String) (s: String) (n: String) (kw: Option String) (ty: DedupedExpr) (cases: List PFormat): M (TranslateOutput M) := do
   let (ty, deps) ← StateT.run (s := deps) do
     processExprAnd constInstance constInstance.levelParams ty 0 fun e =>
-      e.bindLevelParams do
-        let levelParams := specializeLevelParams e.constInstance.constAnalysis e.constInstance.levelInstance e.erased.levelParams
-        formatExprInnerWithLevelParams levelParams.toList [] e.erased.expr
+      let levelParams := specializeLevelParams e.constInstance.constAnalysis e.constInstance.levelInstance e.erased.levelParams
+      formatExprInnerWithLevelParams levelParams.toList [] e.erased.expr
 
   pure <| produceOutput constInstance.constAnalysis deps ns do
     nlprintln s!"--{s}"
@@ -2293,8 +2276,7 @@ def translateRecursor (c: Name) (constInstance: ConstInstance) (ns: Array String
         let mut ((a, b), ctorConst) <- processExprAnd constInstance constInstance.levelParams ruleRhs (val.levelParams.length + val.numParams) λ e ↦ do
           let ab ← formatArgsWithEagerImplicits ty (· - ctor.numFields + 1 + val.numIndices) e
           let ctorLevelParams := constInstance.levelParams.extract val.numMotives constInstance.levelParams.size
-          let ctorConst ← e.bindLevelParams do
-            formatConst ctor.name (ctorLevelParams.toArray.map (.param ·)) id false
+          let ctorConst ← formatConst ctor.name (ctorLevelParams.toArray.map (.param ·)) id false
           pure (ab, ctorConst)
 
         let numLevelParams := constInstance.numSpecializedLevelParams
