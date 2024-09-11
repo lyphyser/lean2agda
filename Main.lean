@@ -1,4 +1,4 @@
-import Export
+import Lean2Agda
 
 import Lean.Util.Path
 import Lean.Environment
