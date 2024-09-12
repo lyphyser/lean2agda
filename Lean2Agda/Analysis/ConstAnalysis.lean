@@ -1,7 +1,8 @@
 import Lean2Agda.Data.OrClause
+import Lean2Agda.Data.LevelInstance
 import Lean2Agda.Data.ExtraBatteries
 import Lean2Agda.Passes.Annotate
-import Lean2Agda.RunMetaM
+import Lean2Agda.Lean.RunMetaM
 
 import Std.Data.HashMap.Basic
 import Std.Data.HashSet.Basic
@@ -27,6 +28,30 @@ structure ConstAnalysis where
   --complexLevelClauses: HashMap (OrClause (Fin numLevels)) (Fin numLevelClauses)
   --complexLevelClauses: Array (OrClause (Fin numLevels))
   deriving Repr
+
+def includeLevelParam (c: ConstAnalysis) (levelInstance: LevelInstance c.numLevelClauses) (i: Fin c.numLevels): Bool :=
+  match c.singletonLevelClauses[i] with
+  | .some ci =>
+    have h := by
+      apply Fin.val_lt_of_le
+      exact c.numSingletonLevelClauses_le
+    levelInstance[ci]'h
+  | .none => true
+
+def specializeLevelParams (c: ConstAnalysis) (levelInstance: LevelInstance c.numLevelClauses) (a: Vector α c.numLevels):
+  Array α :=
+  Fin.foldl c.numLevels (init := Array.empty) λ r i ↦
+    if includeLevelParam c levelInstance i then
+      r.push a[i]
+    else
+      r
+
+def numSpecializedLevelParams (c: ConstAnalysis) (levelInstance: LevelInstance c.numLevelClauses): Nat :=
+  Fin.foldl c.numLevels (init := 0) λ r i ↦
+    if includeLevelParam c levelInstance i then
+      r.succ
+    else
+      r
 
 instance: Inhabited ConstAnalysis where
   default := {

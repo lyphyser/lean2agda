@@ -1,3 +1,5 @@
+import Lean2Agda.Data.Monad
+
 import Lean.Meta.Basic
 import Lean.Util.CollectLevelParams
 import Lean.AddDecl
@@ -14,9 +16,13 @@ variable {M : Type → Type} [Monad M] [MonadExceptOf MessageData M]
 local instance [MonadStateOf α M]: MonadReaderOf α M where
   read := get
 
-structure DedupConfig where
-  options: Options
+structure DedupData where
   dedupPrefix: Name
+
+structure DedupConfig extends DedupData where
+  options: Options
+
+genSubReader (DedupConfig) (DedupData) toDedupData
 
 structure DedupState where
   map: HashMap ExprStructEq Expr := {}

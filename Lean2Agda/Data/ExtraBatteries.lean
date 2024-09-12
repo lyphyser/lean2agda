@@ -42,11 +42,6 @@ def reverseVector {α} (a: Array α) {n: Nat} (f: α → Fin n) {γ} (init: γ) 
 
 variable {M : Type → Type} [Monad M] {ε} [Coe String ε] [MonadExcept ε M]
 
-def unitStateOf: MonadStateOf PUnit M where
-  get := pure ()
-  set _ := pure ()
-  modifyGet f := pure (f ()).1
-
 def toVector (a: Array α) (n: Nat) (desc: String): M (Vector α n) := do
   if h: a.size = n then
     pure ⟨a, h⟩
@@ -114,21 +109,3 @@ instance : Ord Lean.Name where
 
 instance : LT Lean.Name where
   lt n1 n2 := compareName n1 n2 == Ordering.lt
-
-
-macro "genSubReader" "(" superType:term ")" "(" subType:term ")" fieldName:ident : command => `(
-  instance {M: Type → Type} [Monad M] [base: MonadReaderOf $superType M]: MonadReaderOf $subType M where
-    read := do pure (← base.read).$fieldName
-)
-
-macro "genSubMonad" "(" superType:term ")" "(" subType:term ")" fieldLValue:Lean.Parser.Term.structInstLVal fieldName:ident : command => `(
-  instance {M: Type → Type} [Monad M] [base: MonadStateOf $superType M]: MonadStateOf $subType M where
-    get := do pure (← base.get).$fieldName
-    modifyGet f := do pure (← base.modifyGet (λ σ ↦
-      let v := σ.$fieldName
-      let σ := {σ with $fieldLValue := default}
-      let (r, σ') := f v
-      (r, {σ with $fieldLValue := σ'})
-    ))
-    set σ' := base.modifyGet (λ σ ↦ ((), {σ with $fieldLValue := σ'}))
-)

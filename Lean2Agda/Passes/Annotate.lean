@@ -25,6 +25,7 @@ def optionIntToBinder: Option Int → BinderInfo
 
 structure AnnotateContext where
   binderMDatas: Vector KVMap 4
+  implicitKeyword: Name
   projectKeyword: Name
 
 structure AnnotationData where
