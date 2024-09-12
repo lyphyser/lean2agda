@@ -1,3 +1,4 @@
+import Lean2Agda.Data.Value
 import Lean2Agda.Data.OrClause
 import Lean2Agda.Data.LevelInstance
 import Lean2Agda.Data.ExtraBatteries
@@ -100,12 +101,12 @@ where
     | .mvar _ => panic! "mvar level"
 
 partial def getOrComputeConstAnalysis [MonadStateOf GlobalAnalysis M] [MonadLiftT IO M]
-    [MonadReaderOf Environment M] [MonadReaderOf AnnotateContext M] [MonadReaderOf MetaMContext M]
+    [Value Environment] [Value AnnotateContext] [Value MetaMContext]
     (c: Name): M ConstAnalysis := do
   if let .some sig := (← get).consts.get? c then
     return sig
 
-  let env := ← readThe Environment
+  let env := valueOf Environment
   let .some val := env.find? c | throw ↑s!"constant not found: {c}"
 
   let levels := val.levelParams.toArray
@@ -156,11 +157,11 @@ partial def getOrComputeConstAnalysis [MonadStateOf GlobalAnalysis M] [MonadLift
 where
   process (el: ExprLevels) (e: Expr): (StateT (HashSet (OrClause (Fin el.numLevels))) M) Unit := do
     let (e, annotationData) <- StateT.run (s := ({} : AnnotationData)) do
-      runMetaMRo AnnotateContext AnnotationData do
+      runMetaMRo AnnotationData do
         annotateProjs (ε := Lean.MessageData) e
 
-    ReaderT.run (r := annotationData) (m := (StateT (HashSet (OrClause (Fin el.numLevels))) M)) do
-      goWithMData el [] e
+    have := mkValue annotationData
+    goWithMData el [] e
 
   handleConst (el: ExprLevels) (c: Name) (us: List Level) := do
     let constAnalysis ← getOrComputeConstAnalysis c
@@ -169,7 +170,7 @@ where
     let ccs := constAnalysis.levelClauses.map (OrClause.subst · ucs)
     ccs.toArray.forM (collectLevelNonZeroClause el)
 
-  goWithMData (el: ExprLevels) (ms: List MData) (e: Expr) := do
+  goWithMData (el: ExprLevels) [Value AnnotationData] (ms: List MData) (e: Expr) := do
     let go := goWithMData el []
     match e with
     | .sort u =>
@@ -178,10 +179,10 @@ where
       handleConst el c us
     | .proj c _ b => do
       go b
-      let projectKeyword := (← readThe AnnotateContext).projectKeyword
+      let projectKeyword := (valueOf AnnotateContext).projectKeyword
       let projId: Option Nat := ms.findSome? (·.get? projectKeyword)
       if let .some projId := projId then
-        let us: List Level := (← readThe AnnotationData).projectionLevels[projId]!
+        let us: List Level := (valueOf AnnotationData).projectionLevels[projId]!
         handleConst el c us
       else
         panic! s!"proj without our metadata: {e} {ms}"

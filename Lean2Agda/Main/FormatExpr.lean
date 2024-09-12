@@ -1,3 +1,4 @@
+import Lean2Agda.Data.Value
 import Lean2Agda.Data.Monad
 import Lean2Agda.Data.String
 import Lean2Agda.Output.PFormat
@@ -18,14 +19,13 @@ open Lean.Meta (MetaM)
 
 variable {M: Type → Type} [Monad M] [MonadExceptOf MessageData M]
   [MonadLiftT IO M] [MonadStateOf GlobalAnalysis M] [MonadStateOf GlobalNames M] [MonadStateOf Dependencies M] [MonadStateOf ExprState M]
-  [MonadReaderOf BoundLevels M] [MonadReaderOf AnnotationData M] [MonadReaderOf Environment M]
-  [MonadReaderOf DedupData M] [MonadReaderOf Language M] [MonadReaderOf MetaMContext M] [MonadReaderOf AnnotateContext M]
+  [Value BoundLevels] [Value AnnotationData] [Value Environment]
+  [Value DedupData] [Value Language] [Value MetaMContext] [Value AnnotateContext]
 
 local instance : Coe α (M α) where
   coe := pure
 
 abbrev FormatT (M: Type → Type) [Monad M] := ExceptT MessageData <|
-  ReaderT BoundLevels <| ReaderT DedupData <| ReaderT Language <| ReaderT AnnotationData <| ReaderT Environment <| ReaderT AnnotateContext <| ReaderT MetaMContext <|
   StateT GlobalAnalysis <| StateT GlobalNames <| StateT Dependencies <| StateT ExprState <| M
 
 def formatLevel
@@ -57,7 +57,7 @@ where
 
 def formatConst (n: Name) (us: Array Level) (f: String → String) (withLevels: Bool): M PFormat := do
   let constAnalysis ← getOrComputeConstAnalysis n
-  let boundLevels ← readThe BoundLevels
+  let boundLevels := valueOf BoundLevels
   let ucs ← us.mapM (resolveLevel boundLevels)
   let ucs ← toVector ucs constAnalysis.numLevels "levels in const usage expression"
   let ccs := constAnalysis.levelClauses.map (OrClause.subst · (ucs.map (·.toClause)))
@@ -90,12 +90,12 @@ where
   | _, _ => throw m!"argument not found!"
 
   proj (mdatas: List MData) (typeName: Name) (idx: Nat): M PFormat := do
-    let projectKeyword := (← read).projectKeyword
+    let projectKeyword := (valueOf AnnotateContext).projectKeyword
     let projId: Option Nat := mdatas.findSome? (·.get? projectKeyword)
     let .some projId := projId | throw m!"proj without our metadata: {e} {mdatas}"
-    let projectionLevels: List Level := (← readThe AnnotationData).projectionLevels[projId]!
+    let projectionLevels: List Level := (valueOf AnnotationData).projectionLevels[projId]!
 
-    let env := ← readThe Environment
+    let env := valueOf Environment
     let induct := env.find? typeName |>.get!
     let .inductInfo induct := induct | throw m!"projection type is not an inductive"
     let [ctor] := induct.ctors | throw m!"projection type is not an 1-ctor inductive"
@@ -109,7 +109,7 @@ where
 
   handleAppArg (mdatas: List MData) (e: Expr): M PFormat := do
     let e <- go e
-    let implicitKeyword := (← readThe AnnotateContext).implicitKeyword
+    let implicitKeyword := (valueOf AnnotateContext).implicitKeyword
     pure $ encloseWith (maybeBinderSeps <| optionIntToBinder <| mdatas.findSome? (·.get? implicitKeyword)) e
 
   goApp (mdatas: List MData) (f: Expr) (es: List PFormat) : M PFormat := do
@@ -134,7 +134,7 @@ where
       let v := a[i]!
       token v
     | .sort l =>
-      let boundLevels ← readThe BoundLevels
+      let boundLevels := valueOf BoundLevels
       let {add, max := {const, params}} := ← resolveLevel boundLevels l
       if params.toArray.all (·.isNone) then
         match add with
@@ -276,13 +276,7 @@ where
 
 def runFormatTMetaM [MonadLiftT IO M]
   {α : Type} (m: (FormatT MetaM) α): M α := do
-  let boundLevels <- readThe BoundLevels
-  let dedupData <- readThe DedupData
-  let language <- readThe Language
-  let annotationData <- readThe AnnotationData
-  let environment ← readThe Environment
-  let annotateContext ← readThe AnnotateContext
-  let metaMContext ← readThe MetaMContext
+  let environment := valueOf Environment
 
   let globalAnalysis ← modifyGetThe GlobalAnalysis (·, default)
   let globalNames ← modifyGetThe GlobalNames (·, default)
@@ -295,13 +289,6 @@ def runFormatTMetaM [MonadLiftT IO M]
       StateT.run (s := dependencies) do
       StateT.run (s := globalNames) do
       StateT.run (s := globalAnalysis) do
-      ReaderT.run (r := metaMContext) do
-      ReaderT.run (r := annotateContext) do
-      ReaderT.run (r := environment) do
-      ReaderT.run (r := annotationData) do
-      ReaderT.run (r := language) do
-      ReaderT.run (r := dedupData) do
-      ReaderT.run (r := boundLevels) do
       ExceptT.run
         m
 

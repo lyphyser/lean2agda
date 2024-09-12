@@ -43,8 +43,8 @@ def getOrOpenOutputModuleForConst [MonadStateOf ModulesState M]
   | .none =>
     let output ← (IO.getStdout : IO _)
     let ms: ModuleState := {output}
-    ReaderT.run (r := ms) do
-      outputModulePrelude
+    have := mkValue ms
+    outputModulePrelude
 
     let mses: ModulesState := (some ms : ModulesState)
     set mses

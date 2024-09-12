@@ -1,9 +1,5 @@
+import Lean2Agda.Data.Value
 import Lean.Parser.Term
-
-macro "genSubReader" "(" superType:term ")" "(" subType:term ")" fieldName:ident : command => `(
-  instance {M: Type → Type} [Monad M] [base: MonadReaderOf $superType M]: MonadReaderOf $subType M where
-    read := do pure (← base.read).$fieldName
-)
 
 macro "genSubMonad" "(" superType:term ")" "(" subType:term ")" fieldLValue:Lean.Parser.Term.structInstLVal fieldName:ident : command => `(
   instance {M: Type → Type} [Monad M] [base: MonadStateOf $superType M]: MonadStateOf $subType M where
@@ -16,9 +12,6 @@ macro "genSubMonad" "(" superType:term ")" "(" subType:term ")" fieldLValue:Lean
     ))
     set σ' := base.modifyGet (λ σ ↦ ((), {σ with $fieldLValue := σ'}))
 )
-
-def monadReaderOfOfMonadStateOf [MonadStateOf α M]: MonadReaderOf α M where
-  read := get
 
 def unitStateOf [Monad M]: MonadStateOf PUnit M where
   get := pure ()

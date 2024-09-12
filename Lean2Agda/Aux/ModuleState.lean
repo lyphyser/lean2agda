@@ -1,3 +1,4 @@
+import Lean2Agda.Data.Value
 import Lean2Agda.Data.Monad
 import Lean2Agda.Data.ExtraBatteries
 import Lean2Agda.Output.PFormat
@@ -18,12 +19,13 @@ def myPretty (f : Format) (width : Nat := 150) (indent : Nat := 0) (column := 0)
 variable {M: Type → Type} [Monad M] [MonadLiftT IO M]
 
 section
-variable [MonadReaderOf ModuleState M]
+variable [Value ModuleState]
 
 open Std.Format in
 def outputIndented
   (levels: Nat) (f: PFormat): M Unit := do
-  (← read).output.putStr <| (myPretty <| nest ((← read).indentSpace + levels * indentOneLevelSpaces) <| (text "\n") ++ (resolveWithPrec f .bottom)) ++ "\n"
+  let self := valueOf ModuleState
+  self.output.putStr <| (myPretty <| nest (self.indentSpace + levels * indentOneLevelSpaces) <| (text "\n") ++ (resolveWithPrec f .bottom)) ++ "\n"
 
 def output
   (f: PFormat): M Unit := do
@@ -32,7 +34,8 @@ def output
 def println
   (s: String) (pfx: String := ""): M Unit := do
   --output (format (text s))
-  (← read).output.putStr s!"{pfx.pushn ' ' $ (← read).indentSpace}{s}\n"
+  let self := valueOf ModuleState
+  self.output.putStr s!"{pfx.pushn ' ' $ self.indentSpace}{s}\n"
 
 def nlprintln
   (s: String): M Unit := do
@@ -55,8 +58,6 @@ end
 
 variable [MonadStateOf ModuleState M]
 
-local instance: MonadReaderOf ModuleState M := monadReaderOfOfMonadStateOf
-
 def useBrokenNamespaceModules := false
 
 def goToNamespace
@@ -66,5 +67,6 @@ def goToNamespace
     modify fun s => {s with curNamespace := s.curNamespace.extract 0 p, indentSpace := p * indentOneLevelSpaces}
     (a.extract p a.size).forM openModule
 where openModule (m: String): M Unit := do
+  have := ← getValue
   nlprintln s!"module {m} where"
   modify fun s => {s with curNamespace := s.curNamespace.push m, indentSpace := indentOneLevelSpaces}

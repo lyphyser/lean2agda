@@ -1,3 +1,4 @@
+import Lean2Agda.Data.Value
 import Lean2Agda.Data.Monad
 
 import Lean.Meta.Basic
@@ -13,16 +14,13 @@ local instance [Repr α]: ToFormat α where
 
 variable {M : Type → Type} [Monad M] [MonadExceptOf MessageData M]
 
-local instance [MonadStateOf α M]: MonadReaderOf α M where
-  read := get
-
 structure DedupData where
   dedupPrefix: Name
 
 structure DedupConfig extends DedupData where
   options: Options
 
-genSubReader (DedupConfig) (DedupData) toDedupData
+genSubValue (DedupConfig) (DedupData) toDedupData
 
 structure DedupState where
   map: HashMap ExprStructEq Expr := {}
@@ -42,13 +40,15 @@ structure Preserve where
   kind: PreserveKind
   n: Nat
 
-partial def dedupExprs [MonadReaderOf DedupConfig M]
+def DedupRunState := HashMap ExprStructEq (Option Expr)
+
+partial def dedupExprs [Value DedupConfig]
     [MonadStateOf DedupState M] [MonadLiftT MetaM M]
-    (es: Array (Expr × Option Preserve)): M (Array DedupedExpr) :=
-  let extract {M: Type → Type} [Monad M] [MonadReaderOf DedupConfig M] [MonadStateOf DedupState M] [MonadLiftT MetaM M]
+    (es: Array (Expr × Option Preserve)): M (Array DedupedExpr) := do
+  let extract {M: Type → Type} [Monad M] [MonadStateOf DedupState M] [MonadLiftT MetaM M]
       (e: Expr) (type: Expr): M Expr := do
     let idx ← modifyGetThe DedupState (λ {map, numConsts} ↦ (numConsts, {map, numConsts := numConsts.succ}))
-    let name := Name.num (← read).dedupPrefix idx
+    let name := Name.num (valueOf DedupConfig).dedupPrefix idx
     let levelParamsState: CollectLevelParams.State := {}
     let levelParamsState := levelParamsState.collect type
     let levelParamsState := levelParamsState.collect e
@@ -62,7 +62,7 @@ partial def dedupExprs [MonadReaderOf DedupConfig M]
       value := e
     }
     let decl := .defnDecl defn
-    let options := (← read).options
+    let options := (valueOf DedupConfig).options
     let m: MetaM Unit := do
       let r ← modifyGetThe Core.State λ st ↦ match st.env.addDecl options decl with
         | .ok env => (.ok (), {st with env})
@@ -72,7 +72,7 @@ partial def dedupExprs [MonadReaderOf DedupConfig M]
 
     pure <| .const name (levelParams.map (.param ·))
 
-  let rec mark {M: Type → Type} [Monad M] [MonadStateOf (HashMap ExprStructEq (Option Expr)) M] [MonadLiftT MetaM M]
+  let rec mark {M: Type → Type} [Monad M] [MonadStateOf DedupRunState M] [MonadLiftT MetaM M]
       (e: Expr): M Unit := do
     let cont ←
       if e.hasLooseBVars || e.approxDepth == 0 then -- TODO: support extracting exprs with loose bvars
@@ -98,7 +98,7 @@ partial def dedupExprs [MonadReaderOf DedupConfig M]
       | .proj _ _ b => do mark b
       | _ => pure ()
 
-  let rec markPreserve {M: Type → Type} [Monad M] [MonadExceptOf MessageData M] [MonadStateOf (HashMap ExprStructEq (Option Expr)) M] [MonadLiftT MetaM M]
+  let rec markPreserve {M: Type → Type} [Monad M] [MonadExceptOf MessageData M] [MonadStateOf DedupRunState M] [MonadLiftT MetaM M]
     (e: Expr) (p: PreserveKind) (n: Nat): M Unit := do
     if n == 0 then
       mark e
@@ -120,8 +120,8 @@ partial def dedupExprs [MonadReaderOf DedupConfig M]
       | _ =>
         fail
 
-  let rec dedup {M: Type → Type} [Monad M] [MonadReaderOf DedupConfig M] [MonadLiftT MetaM M]
-      [MonadReaderOf (HashMap ExprStructEq (Option Expr)) M] [MonadStateOf DedupState M]
+  let rec dedup {M: Type → Type} [Monad M] [MonadLiftT MetaM M]
+      [Value DedupRunState] [MonadStateOf DedupState M]
       (e: Expr): M Expr := do
     let replacement := (← get).map.get? e
     if let .some replacement := replacement then do
@@ -135,7 +135,7 @@ partial def dedupExprs [MonadReaderOf DedupConfig M]
       | e@(.app l r) => pure e.updateApp! <*> dedup l <*> dedup r
       | e@(.proj _ _ b) => e.updateProj! <$> dedup b
       | e => pure e
-      match (← read).get? e with
+      match (valueOf DedupRunState).get? e with
       | .some (.some replacementType) =>
         let replacement ← extract e' (← dedup replacementType)
         modifyGet (λ {map, numConsts} ↦ ((), {map := map.insert e replacement, numConsts}))
@@ -143,8 +143,8 @@ partial def dedupExprs [MonadReaderOf DedupConfig M]
       | _ =>
         pure <| e'
 
-  let rec dedupPreserve {M: Type → Type} [Monad M] [MonadExceptOf MessageData M] [MonadReaderOf DedupConfig M] [MonadLiftT MetaM M]
-      [MonadReaderOf (HashMap ExprStructEq (Option Expr)) M] [MonadStateOf DedupState M]
+  let rec dedupPreserve {M: Type → Type} [Monad M] [MonadExceptOf MessageData M] [MonadLiftT MetaM M]
+      [Value DedupRunState] [MonadStateOf DedupState M]
       (e: Expr) (p: PreserveKind) (n: Nat): M Expr := do
     if n == 0 then
       dedup e
@@ -166,23 +166,26 @@ partial def dedupExprs [MonadReaderOf DedupConfig M]
       | _ =>
         fail
 
-  StateT.run' (m := M) (s := (HashMap.empty: HashMap ExprStructEq (Option Expr))) do
+  let s: DedupRunState := HashMap.empty
+  let (_, s) := ← StateT.run (m := M) (s := s) do
     es.forM λ (e, p) ↦ do
       match p with
       | .none => mark e
       | .some p => markPreserve e p.kind p.n
-    es.mapM λ (e, p) ↦ do
-      pure { deduped :=
-        ← match p with
-        | .none => dedup e
-        | .some p => dedupPreserve e p.kind p.n
-      }
 
-def isDedupConst [MonadReaderOf DedupConfig M]
+  have := mkValue s
+  es.mapM λ (e, p) ↦ do
+    pure { deduped :=
+      ← match p with
+      | Option.none => dedup e
+      | .some p => dedupPreserve e p.kind p.n
+    }
+
+def isDedupConst [Value DedupConfig]
     (name: Name): M Bool := do
   let needed ← match name with
   | .num p _ =>
-    if p == (← read).dedupPrefix then
+    if p == (valueOf DedupConfig).dedupPrefix then
       return true
     else
       pure false

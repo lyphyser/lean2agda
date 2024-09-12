@@ -1,3 +1,4 @@
+import Lean2Agda.Data.Value
 import Lean2Agda.Analysis.ConstAnalysis
 import Lean2Agda.Aux.ConstInstance
 import Lean2Agda.Aux.ModulesState
@@ -29,9 +30,7 @@ variable {M: Type → Type} [Monad M] [MonadExceptOf MessageData M]
 
 variable [MonadLiftT IO M]
   [MonadStateOf GlobalAnalysis M] [MonadStateOf GlobalNames M] [MonadStateOf Visited M] [MonadStateOf Environment M] [MonadStateOf DedupState M] [MonadStateOf ModulesState M]
-  [MonadReaderOf Language M] [MonadReaderOf DedupData M] [MonadReaderOf AnnotateContext M] [MonadReaderOf EraseContext M] [MonadReaderOf DedupConfig M] [MonadReaderOf MetaMContext M]
-
-instance: MonadReaderOf Environment M := monadReaderOfOfMonadStateOf
+  [Value Language] [Value DedupData] [Value AnnotateContext] [Value EraseContext] [Value DedupConfig] [Value MetaMContext]
 
 def TranslateOutput (M: Type → Type) := (Array (Name × GenLevelInstance)) × M Unit
 
@@ -41,17 +40,16 @@ def afterDependencies (deps: Dependencies) (m: M Unit): TranslateOutput M :=
   let deps := deps.dependencies.toArray.qsort (Ordering.isLT $ compare · ·)
   ⟨deps, m⟩
 
-def produceOutput (ci: ConstAnalysis) (deps: Dependencies) (ns: Array String) (m: ReaderT ModuleState M Unit): TranslateOutput M :=
+def produceOutput (ci: ConstAnalysis) (deps: Dependencies) (ns: Array String) (m: [Value ModuleState] → M Unit): TranslateOutput M :=
   afterDependencies deps do
     let ms ← getOrOpenOutputModuleForConst ci
     let (_, ms) ← StateT.run (s := ms) do
       goToNamespace ns
-    ReaderT.run (r := ms)
-      m
+    have := mkValue ms
+    m
 
 def translateInductive (c: Name) (constInstance: ConstInstance) (ns: Array String) (n: String) (val: InductiveVal): M (TranslateOutput M) := do
-  let env ← getThe Environment
-  let ctors <- val.ctors.toArray.mapM fun ctor => do match (env.find? ctor |>.get!) with
+  let ctors <- val.ctors.toArray.mapM fun ctor => do match ((← getThe Environment).find? ctor |>.get!) with
     | .ctorInfo ctor => pure ctor
     | _ => throw m!"inductive ctor is not a ctor"
 
@@ -65,6 +63,7 @@ def translateInductive (c: Name) (constInstance: ConstInstance) (ns: Array Strin
   let ctorTypes := es.extract 1 es.size
   let deps: Dependencies := {}
 
+  have := ← getTheValue Environment
   let numParamsToExtract := val.levelParams.length + fixedNumParams
   let ((typeParams, type), deps) <- StateT.run (s := deps) do
     processExprAnd constInstance constInstance.levelParams ty numParamsToExtract fun processedType => do
@@ -134,7 +133,7 @@ def translateInductive (c: Name) (constInstance: ConstInstance) (ns: Array Strin
       if val.name == `Nat then
         nlprintln "{-# BUILTIN NATURAL Nat #-}"
 
-def translateFun
+def translateFun [Value Environment]
     (constInstance: ConstInstance)
     (deps: Dependencies) (ns: Array String) (s: String) (n: String) (kw: Option String) (ty: DedupedExpr) (cases: List PFormat): M (TranslateOutput M) := do
   let (ty, deps) ← StateT.run (s := deps) do
@@ -156,8 +155,7 @@ def translateFun
       output s
 
 def translateRecursor (c: Name) (constInstance: ConstInstance) (ns: Array String) (n: String) (val: RecursorVal): M (TranslateOutput M) := do
-  let env ← getThe Environment
-  let ctors <- val.rules.mapM fun rule => do match (env.find? rule.ctor |>.get!) with
+  let ctors <- val.rules.mapM fun rule => do match ((← getThe Environment).find? rule.ctor |>.get!) with
     | .ctorInfo ctor => pure ctor
     | _ => throw m!"inductive ctor is not a ctor"
 
@@ -173,6 +171,7 @@ def translateRecursor (c: Name) (constInstance: ConstInstance) (ns: Array String
   let rulesRhs := (es.extract 1 es.size).toList
   let deps: Dependencies := {}
 
+  have := ← getTheValue Environment
   let ((p, cases), deps) ← StateT.run (s := deps) do
     let (params, _) <- processExprAnd constInstance constInstance.levelParams ty (val.levelParams.length + val.numParams) fun e => do
       formatParamsAndProcessedExpr e (val.levelParams.length + numGen)
@@ -227,6 +226,7 @@ def translateDef
   let v := es.get? 1
   let deps: Dependencies := {}
 
+  have := ← getTheValue Environment
   let ((p, cases), deps) ← StateT.run (s := deps) do
     if c == `WellFounded.fixFEq then
       pure (some "postulate", [])
@@ -253,10 +253,12 @@ def translateConstant'
     return some none
 
   let r ← try
-    let env := ← getThe Environment
-    let .some val := env.find? c | throw m!"not found"
+    let .some val := (← getThe Environment).find? c | throw m!"not found"
 
-    let constAnalysis ← getOrComputeConstAnalysis c
+    let constAnalysis ← (
+      have := ← getTheValue Environment
+      getOrComputeConstAnalysis c
+    )
     let levelInstance ← toVector levelInstance constAnalysis.numLevelClauses "level kinds in level instance for constant to be translated"
     let levelParams ← toVector val.levelParams.toArray constAnalysis.numLevels "level parameters in constant declaration compared to analysis"
     let .some constInstance := makeConstInstance constAnalysis levelInstance levelParams | return none
@@ -324,7 +326,10 @@ def translateConstant
 @[noinline, nospecialize]
 partial def translateConstantVariants
   (c : Name): M Unit := do
-  let constAnalysis ← getOrComputeConstAnalysis c
+  let constAnalysis ← (
+    have := ← getTheValue Environment
+    getOrComputeConstAnalysis c
+  )
   StateT.run' (s := #[]) do
     go constAnalysis.numLevelClauses
 where

@@ -1,3 +1,4 @@
+import Lean2Agda.Data.Value
 import Lean.Meta.Basic
 import Batteries.Data.Vector.Basic
 
@@ -33,7 +34,7 @@ structure AnnotationData where
   deriving Inhabited
 
 open Lean.Meta in
-def annotateApp [MonadReaderOf AnnotateContext M] [MonadLiftT MetaM M]
+def annotateApp [Value AnnotateContext] [MonadLiftT MetaM M]
     (e : Expr): M Expr := do
   match e with
   | Expr.app f b => do
@@ -44,7 +45,7 @@ def annotateApp [MonadReaderOf AnnotateContext M] [MonadLiftT MetaM M]
       let e := e.updateApp! f b
       --IO.println s!"-- app: {implicit}: {e} === {ft}"
       if bi != .default then
-        let m := (← read).binderMDatas[binderToFin bi]
+        let m := (valueOf AnnotateContext).binderMDatas[binderToFin bi]
         pure $ .mdata m e
       else
         pure $ e
@@ -53,7 +54,7 @@ def annotateApp [MonadReaderOf AnnotateContext M] [MonadLiftT MetaM M]
   | _ => return e
 
 open Lean.Meta in
-def annotateProj [MonadReaderOf AnnotateContext M] [MonadStateOf AnnotationData M] [MonadLiftT MetaM M]
+def annotateProj [Value AnnotateContext] [MonadStateOf AnnotationData M] [MonadLiftT MetaM M]
     (e : Expr): M Expr := do
   match e with
   | Expr.proj typeName _projIdx structExpr => do
@@ -65,7 +66,7 @@ def annotateProj [MonadReaderOf AnnotateContext M] [MonadStateOf AnnotationData 
         throw ↑s!"structTypeName differs from typeName: {structTypeName} {typeName}"
 
       let idx <- modifyGet fun st => (st.projectionLevels.size, {st with projectionLevels := st.projectionLevels.push (typeLevels)})
-      let m := KVMap.empty.setNat (← read).projectKeyword idx
+      let m := KVMap.empty.setNat (valueOf AnnotateContext).projectKeyword idx
       pure <| .mdata m e
     else
       throw ↑s!"structType is not a const: {structType}"
@@ -78,7 +79,7 @@ where
   | .mdata _ e => e
   | e => e
 
-def annotateExpr [MonadReaderOf AnnotateContext M] [MonadStateOf AnnotationData M] [MonadLiftT MetaM M] [MonadControlT MetaM M]
+def annotateExpr [Value AnnotateContext] [MonadStateOf AnnotationData M] [MonadLiftT MetaM M] [MonadControlT MetaM M]
   (e : Expr) : M Expr :=
   Meta.transform (m := M) e (post := fun e => do
     match e with
@@ -87,7 +88,7 @@ def annotateExpr [MonadReaderOf AnnotateContext M] [MonadStateOf AnnotationData 
     | _ => return .continue
   )
 
-def annotateProjs [MonadReaderOf AnnotateContext M] [MonadStateOf AnnotationData M] [MonadLiftT MetaM M] [MonadControlT MetaM M]
+def annotateProjs [Value AnnotateContext] [MonadStateOf AnnotationData M] [MonadLiftT MetaM M] [MonadControlT MetaM M]
   (e : Expr) : M Expr :=
   Meta.transform (m := M) e (post := fun e => do
     match e with

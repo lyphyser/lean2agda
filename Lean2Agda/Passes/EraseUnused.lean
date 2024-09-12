@@ -32,7 +32,7 @@ def eraseUnused {numLevels: Nat} (ctx: EraseContext) (annotationData: Annotation
     Id.run do
       StateT.run (s := {}) do
         go e (keep - numLevels)
-  let levelParams := Vector.ofFn λ i => if i < keep || s.usedLevels.contains levelParams[i] then levelParams[i] else Name.anonymous
+  let levelParams := Vector.ofFn λ i => if i.val < keep || s.usedLevels.contains levelParams[i] then levelParams[i] else Name.anonymous
   {levelParams, expr}
 where
   go (e : Expr) (u: Nat) := goWithMData [] e u

@@ -1,3 +1,4 @@
+import Lean2Agda.Data.Value
 import Lean2Agda.Data.Monad
 import Lean2Agda.Data.LevelInstance
 import Lean2Agda.Aux.HygienicNames
@@ -23,7 +24,7 @@ structure GlobalNames where
 genSubMonad (GlobalNames) (HygienicNames) hygienicNames hygienicNames
 
 variable {M: Type → Type} [Monad M] [MonadExceptOf MessageData M]
-   [MonadReaderOf Language M] [MonadReaderOf DedupData M]
+   [Value Language] [Value DedupData]
    [MonadStateOf GlobalNames M]
 
 def stringifyUnqualifiedName
@@ -59,7 +60,7 @@ where
           pure s
         toNameDot p n s!"{s}{suffix}"
       | .num n i =>
-        if n == (← readThe DedupData).dedupPrefix then
+        if n == (valueOf DedupData).dedupPrefix then
           pure s!"#{i}"
         else
           toNameDot p n s!"{intPrefix}{i}{suffix}"

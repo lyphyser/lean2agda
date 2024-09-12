@@ -1,3 +1,4 @@
+import Lean2Agda.Data.Value
 import Lean2Agda.Aux.Ident
 import Std.Data.HashMap.Basic
 
@@ -8,7 +9,7 @@ structure HygienicNames where
   deriving Inhabited
 
 variable {M: Type → Type} [Monad M]
-  [MonadStateOf HygienicNames M] [MonadReaderOf Language M]
+  [MonadStateOf HygienicNames M] [Value Language]
 
 def makeHygienicName
   (v: String) (f: String → M α): M α := do

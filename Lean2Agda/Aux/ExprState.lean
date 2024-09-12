@@ -1,3 +1,4 @@
+import Lean2Agda.Data.Value
 import Lean2Agda.Data.Monad
 import Lean2Agda.Aux.HygienicNames
 
@@ -16,7 +17,7 @@ structure ExprState where
 genSubMonad (ExprState) (HygienicNames) hygienicNames hygienicNames
 
 variable {M: Type → Type} [Monad M] [MonadExceptOf MessageData M]
-  [MonadStateOf ExprState M] [MonadReaderOf Language M]
+  [MonadStateOf ExprState M] [Value Language]
 
 def withLocalName
   {α: Type} [Inhabited α] (name : Name) (pattern: Bool) (f: String → M α): M α :=
