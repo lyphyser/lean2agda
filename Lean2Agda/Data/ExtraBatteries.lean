@@ -53,6 +53,14 @@ def mapM {α β} (f : α → M β) (v : Vector α n) : M (Vector β n) := do
   toVector (← v.toArray.mapM f) n "elements produced by mapM on Vector"
 end Batteries.Vector
 
+namespace Array
+@[inline]
+def backPop? (a: Array α): Option (α × Array α) :=
+  let back := a.back?
+  match back with
+  | .some x => some (x, a.pop)
+  | .none => none
+end Array
 
 instance {α : Type u} [Ord α] : Ord (Array α) where
   compare x y :=

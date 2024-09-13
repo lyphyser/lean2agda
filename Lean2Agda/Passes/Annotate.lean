@@ -1,11 +1,11 @@
+import Lean2Agda.Data.Monad
 import Lean2Agda.Data.Value
 import Lean.Meta.Basic
 import Batteries.Data.Vector.Basic
 
 open Batteries (Vector)
 open Lean
-
-variable {M : Type → Type} [Monad M] {e} [Coe String ε] [MonadExceptOf ε M]
+open Lake (EStateT)
 
 def binderToFin: BinderInfo → Fin 4
 | .default => 0
@@ -33,8 +33,11 @@ structure AnnotationData where
   projectionLevels: Array (List Level) := #[]
   deriving Inhabited
 
+local macro "M": term => `(EStateT MessageData AnnotationData MetaM)
+variable [Value AnnotateContext]
+
 open Lean.Meta in
-def annotateApp [Value AnnotateContext] [MonadLiftT MetaM M]
+def annotateApp
     (e : Expr): M Expr := do
   match e with
   | Expr.app f b => do
@@ -54,7 +57,7 @@ def annotateApp [Value AnnotateContext] [MonadLiftT MetaM M]
   | _ => return e
 
 open Lean.Meta in
-def annotateProj [Value AnnotateContext] [MonadStateOf AnnotationData M] [MonadLiftT MetaM M]
+def annotateProj
     (e : Expr): M Expr := do
   match e with
   | Expr.proj typeName _projIdx structExpr => do
@@ -79,19 +82,19 @@ where
   | .mdata _ e => e
   | e => e
 
-def annotateExpr [Value AnnotateContext] [MonadStateOf AnnotationData M] [MonadLiftT MetaM M] [MonadControlT MetaM M]
+def annotateExpr
   (e : Expr) : M Expr :=
   Meta.transform (m := M) e (post := fun e => do
     match e with
-    | Expr.app _ _ => return .done (← annotateApp (ε := ε) e)
-    | Expr.proj _ _ _ => return .done (← annotateProj (ε := ε) e)
+    | Expr.app _ _ => return .done (← annotateApp e)
+    | Expr.proj _ _ _ => return .done (← annotateProj e)
     | _ => return .continue
   )
 
-def annotateProjs [Value AnnotateContext] [MonadStateOf AnnotationData M] [MonadLiftT MetaM M] [MonadControlT MetaM M]
+def annotateProjs
   (e : Expr) : M Expr :=
   Meta.transform (m := M) e (post := fun e => do
     match e with
-    | Expr.proj _ _ _ => return .done (← annotateProj (ε := ε) e)
+    | Expr.proj _ _ _ => return .done (← annotateProj e)
     | _ => return .continue
   )

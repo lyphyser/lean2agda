@@ -1,15 +1,14 @@
 import Lean2Agda.Data.Value
 import Lean2Agda.Output.Language
 
-variable {M: Type → Type} [Monad M]
-  [Value Language]
+variable  [Value Language]
 
 -- not including space or @.(){};_
 -- TODO: handle identifiers conflicting with Agda defs
 def stringifyIdent
-  (s : String) : M String := do
+  (s : String) : String :=
   let s := s.foldl stringifyIdentAux ""
-  pure <| if (valueOf Language).keywords.contains s then
+  if (valueOf Language).keywords.contains s then
     "`" ++ s ++ "`"
   else
     s

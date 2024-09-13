@@ -12,28 +12,73 @@ import Lean2Agda.Aux.GlobalNames
 import Lean2Agda.Aux.ProcessedExpr
 import Lean2Agda.Lean.RunMetaM
 import Lean.Message
+import Lake.Util.EStateT
 
 open Lean (Expr MData Level MessageData Name Environment BinderInfo)
+open Lake (EStateT)
 open Lean.Meta (MetaM)
 
+structure FormatState where
+  globalNames : GlobalNames
+  globalAnalysis: GlobalAnalysis
+  dependencies: Dependencies
+  exprState: ExprState
+  deriving Inhabited
 
-variable {M: Type → Type} [Monad M] [MonadExceptOf MessageData M]
-  [MonadLiftT IO M] [MonadStateOf GlobalAnalysis M] [MonadStateOf GlobalNames M] [MonadStateOf Dependencies M] [MonadStateOf ExprState M]
-  [Value BoundLevels] [Value AnnotationData] [Value Environment]
+genSubMonad (FormatState) (GlobalAnalysis) globalAnalysis globalAnalysis
+genSubMonad (FormatState) (GlobalNames) globalNames globalNames
+genSubMonad (FormatState) (ExprState) exprState exprState
+genSubMonad (FormatState) (Dependencies) dependencies dependencies
+
+abbrev FormatT (M: Type → Type) [Monad M] := EStateT MessageData FormatState <| M
+
+-- TODO: maybe we should autogenerate this by changing genSubMonad, and possibly implement MonadStateOf instead of only MonadLift
+instance {M: Type → Type} [Monad M] [MonadExceptOf MessageData M] {N: Type → Type} [Monad N] [MonadLiftT N M]
+  [MonadStateOf GlobalNames M] [MonadStateOf GlobalAnalysis M] [MonadStateOf Dependencies M] [MonadStateOf ExprState M]:
+  MonadLiftT (FormatT N) M where
+  monadLift act := do
+    let s := {
+      globalNames := ← modifyGetThe GlobalNames (·, default)
+      globalAnalysis := ← modifyGetThe GlobalAnalysis (·, default)
+      dependencies := ← modifyGetThe Dependencies (·, default)
+      exprState := ← modifyGetThe ExprState (·, default)
+    }
+    let r :=  EStateT.run s act
+    let r ← liftM r
+    let s := r.state
+    set s.globalNames
+    set s.globalAnalysis
+    set s.dependencies
+    set s.exprState
+    match r with
+    | .ok x _ => pure x
+    | .error e _ => throw e
+
+variable [Value BoundLevels] [Value AnnotationData] [Value Environment]
   [Value DedupData] [Value Language] [Value MetaMContext] [Value AnnotateContext]
 
-local instance : Coe α (M α) where
-  coe := pure
+local macro "M": term => `(FormatT IO)
 
-abbrev FormatT (M: Type → Type) [Monad M] := ExceptT MessageData <|
-  StateT GlobalAnalysis <| StateT GlobalNames <| StateT Dependencies <| StateT ExprState <| M
+def bindStr
+  {α: Type} [Inhabited α] (n: String) (e: M α): M (String × α) := do
+  (bindStr' n).withMe λ n ↦ do pure (n, ← e)
+
+def bindIf
+  {α: Type} [Inhabited α] (pattern: Bool) (n: Name) (e: M α): M (String × α) := do
+  (← bindIf' pattern n).withMe λ n ↦ do pure (n, ← e)
+
+def bind {α: Type} [Inhabited α] (n: Name) (e: M α): M (String × α) := do
+  (← bind' n).withMe λ n ↦ do pure (n, ← e)
+
+def bindMM {α: Type} [Inhabited α] (n: Name) (e: (FormatT MetaM) α): (FormatT MetaM) (String × α) := do
+  (← bind' n).withMe λ n ↦ do pure (n, ← e)
 
 def formatLevel
   (ci: ConstInstance) (nl : NormLevel ci.numLevels): M PFormat := do
   let {add, max := {const, params}} := nl
 
   if params.toArray.all (·.isNone) then
-    lconst (add + const)
+    pure <| lconst (add + const)
   else
     let es := if const != 0 then
       #[lconst const]
@@ -42,26 +87,31 @@ def formatLevel
     let es ← pure <| es.append <| ← Fin.foldlM ci.numLevels (init := #[]) λ ps l => do
       match params[l] with
       | .none =>
-        ps
+        pure <| ps
       | .some padd =>
-        ps.push <| ← do match ci.idx2output[l] with
-        | .none => lconst <| (panic! "zero level param in normalized level!") + padd
+        pure <| ps.push <| ← do match ci.idx2output[l] with
+        | .none => pure <| lconst <| (panic! "zero level param in normalized level!") + padd
         | .some n => pure <| ladd padd <| ← lparam n
 
-    ladd add (lmax es.toList)
+    pure <| ladd add (lmax es.toList)
 where
   lparam: Name → M PFormat
   | .anonymous => pure $ token $ "_"
-  | .str Name.anonymous v => do pure $ token $ ← stringifyIdent v
+  | .str Name.anonymous v => do pure $ token $ stringifyIdent v
   | n => throw m!"unexpected level name: {n}"
+
+--set_option trace.Meta.synthInstance true
+--set_option trace.Meta.isDefEq true
 
 def formatConst (n: Name) (us: Array Level) (f: String → String) (withLevels: Bool): M PFormat := do
   let constAnalysis ← getOrComputeConstAnalysis n
   let boundLevels := valueOf BoundLevels
-  let ucs ← us.mapM (resolveLevel boundLevels)
+  let ucs := us.mapM (resolveLevel boundLevels)
+  let ucs ← ucs
   let ucs ← toVector ucs constAnalysis.numLevels "levels in const usage expression"
   let ccs := constAnalysis.levelClauses.map (OrClause.subst · (ucs.map (·.toClause)))
-  let levelInstance ← ccs.mapM (resolveSimplifiedLevelClause boundLevels.constInstance)
+  let levelInstance := ccs.mapM (resolveSimplifiedLevelClause boundLevels.constInstance)
+  let levelInstance ← levelInstance
   let ucs := specializeLevelParams constAnalysis levelInstance ucs
 
   addDependency n levelInstance.toArray
@@ -72,7 +122,7 @@ def formatConst (n: Name) (us: Array Level) (f: String → String) (withLevels: 
     let levels: List PFormat := (← ucs.mapM <| fun nl => do pure <| encloseWith levelBinderSeps (← formatLevel boundLevels.constInstance nl)).toList
     pure <| app c levels
   else
-    c
+    pure c
 
 def formatExprInner
   (mdatas: List MData) (e : Expr) : M PFormat := do
@@ -84,7 +134,7 @@ where
   go (e : Expr) := goWithMData [] e
 
   argName: Expr → Nat → M Name
-  | .forallE n _ _ _, .zero => n
+  | .forallE n _ _ _, .zero => pure n
   | .forallE _ _ b _, .succ n => argName b n
   | .mdata _ e, n => argName e n
   | _, _ => throw m!"argument not found!"
@@ -104,7 +154,7 @@ where
     let fieldName := ← argName ctor.type (ctor.numParams + idx)
     let .str Name.anonymous fieldName := fieldName | throw m!"unexpected field name"
 
-    let fieldName ← stringifyIdent fieldName
+    let fieldName := stringifyIdent fieldName
     formatConst typeName projectionLevels.toArray (· ++ "." ++ fieldName) true
 
   handleAppArg (mdatas: List MData) (e: Expr): M PFormat := do
@@ -118,26 +168,26 @@ where
       goApp [] f ((← handleAppArg mdatas e) :: es)
     | .proj typeName idx e =>
       let e <- go e
-      app (← proj mdatas typeName idx) (e :: es)
+      pure <| app (← proj mdatas typeName idx) (e :: es)
     | .const n us =>
-      app (← formatConst n us.toArray id true) es
+      pure <| app (← formatConst n us.toArray id true) es
     | .mdata m f =>
       goApp (m :: mdatas) f es
     | f =>
-      app (← go f) es
+      pure <| app (← go f) es
 
   goWithMData (mdatas: List MData) (e : Expr): M PFormat := do
     match e with
     | .bvar i =>
-      let a := (← get).bvarValues
+      let a := (← getThe ExprState).bvarValues
       let i := a.size - 1 - i
       let v := a[i]!
-      token v
+      pure <| token v
     | .sort l =>
       let boundLevels := valueOf BoundLevels
       let {add, max := {const, params}} := ← resolveLevel boundLevels l
       if params.toArray.all (·.isNone) then
-        match add with
+        pure <| match add with
         | 0 => token "Prop"
         | 1 => token "Set₁"
         | 2 => token "Set₂"
@@ -152,9 +202,9 @@ where
       else
         match add with
         | .succ addp =>
-          app (token "Type") [← formatLevel boundLevels.constInstance {add := addp, max := {const, params}}]
+          pure <| app (token "Type") [← formatLevel boundLevels.constInstance {add := addp, max := {const, params}}]
         | .zero =>
-          app (token "Set") [← formatLevel boundLevels.constInstance {add, max := {const, params}}]
+          pure <| app (token "Set") [← formatLevel boundLevels.constInstance {add, max := {const, params}}]
     | .const n us =>
       formatConst n us.toArray id true
     | .app f e =>
@@ -162,27 +212,27 @@ where
     | .lam n d b bi =>
       let (n, b) <- bind n (go b)
       if d == .const Name.anonymous [] then
-        lambdaArrow [encloseWith (maybeBinderSeps bi) (token n)] b
+        pure <| lambdaArrow [encloseWith (maybeBinderSeps bi) (token n)] b
       else
         -- TODO: this should probably be maybeBinderSeps, and also should fix the lambda representation
-        lambdaArrow [encloseWith (alwaysBinderSeps bi) (typing (token n) (← go d))] b
+        pure <| lambdaArrow [encloseWith (alwaysBinderSeps bi) (typing (token n) (← go d))] b
     | .letE n d v b _ =>
       let (n, b) <- bind n (go b)
-      inExpr [stmts [typing (kwToken "let" n) (← go d), define (token n) [← go v]]] b
+      pure <| inExpr [stmts [typing (kwToken "let" n) (← go d), define (token n) [← go v]]] b
     | .forallE n d b bi =>
       let (n, b) <- bind n (go b)
       let d ← go d
       let a: PFormat <- if n == "_" then
-        encloseWith (maybeBinderSeps bi) d
+        pure <| encloseWith (maybeBinderSeps bi) d
       else
-        encloseWith (alwaysBinderSeps bi) (typing (token n) d)
-      arrow [a] b
+        pure <| encloseWith (alwaysBinderSeps bi) (typing (token n) d)
+      pure <| arrow [a] b
     | .fvar .. => throw m!"fvar"
     | .mvar .. => throw m!"mvar"
     | .proj t i e =>
-      app (← proj mdatas t i) [← go e]
-    | .lit (.natVal i) => token s!"{i}"
-    | .lit (.strVal s) => token s!"\"{s.escape}\""
+      pure <| app (← proj mdatas t i) [← go e]
+    | .lit (.natVal i) => pure <| token s!"{i}"
+    | .lit (.strVal s) => pure <| token s!"\"{s.escape}\""
     | .mdata m e => goWithMData (m :: mdatas) e
 
 def extractLevelParams
@@ -214,7 +264,7 @@ def formatLevelParams
 
 def formatExprInnerWithLevelParams
   (levelParams: List Name) (ms: List MData) (e : Expr) : M PFormat := do
-  arrow (← formatLevelParams levelParams).data (← formatExprInner ms e)
+  pure <| arrow (← formatLevelParams levelParams).data (← formatExprInner ms e)
 
 def formatTypeParamsAndHandleExpr
   [Inhabited α] (e: Expr) (minimum: Nat) (strict: Bool) (f: List MData → Expr → M α): M ((Array ((Option BinderInfo) × String × PFormat)) × α) := do
@@ -272,37 +322,13 @@ where
       pure (a.push (bi, n), b)
     | e => do
       let (a, v) ← f mdatas e depth
-      (a.reverse, v)
+      pure <| (a.reverse, v)
 
-def runFormatTMetaM [MonadLiftT IO M]
-  {α : Type} (m: (FormatT MetaM) α): M α := do
-  let environment := valueOf Environment
-
-  let globalAnalysis ← modifyGetThe GlobalAnalysis (·, default)
-  let globalNames ← modifyGetThe GlobalNames (·, default)
-  let dependencies ← modifyGetThe Dependencies (·, default)
-  let exprState ← modifyGetThe ExprState (·, default)
-
-  let ⟨((((x, globalAnalysis), globalNames), dependencies), exprState), _environment⟩ ←
-    runMetaM'' environment do
-      StateT.run (s := exprState) do
-      StateT.run (s := dependencies) do
-      StateT.run (s := globalNames) do
-      StateT.run (s := globalAnalysis) do
-      ExceptT.run
-        m
-
-  set exprState
-  set dependencies
-  set globalNames
-  set globalAnalysis
-  MonadExcept.ofExcept x
-
-partial def formatEagerImplicitsAndHandleExpr [MonadLiftT IO M] {α} [Inhabited α] (e: Expr) (skip: Nat)
+partial def formatEagerImplicitsAndHandleExpr {α} [Inhabited α] (e: Expr) (skip: Nat)
     (f: List MData → Expr → (FormatT MetaM) ((Array ((Option BinderInfo) × String)) × α))
     : M (Array ((Option BinderInfo) × String) × α) := do
   let (revTypeParams, expr) <-
-    runFormatTMetaM do
+    runMetaMRo FormatState do
       go [] e skip #[]
   pure (revTypeParams.reverse, expr)
 where
@@ -324,7 +350,7 @@ where
               `l
             else
               n
-            let (n, (a, e)) <- bind n (go [] b 0 fvars)
+            let (n, (a, e)) <- bindMM n (go [] b 0 fvars)
             pure (a.push (some bi, n), e)
           else
             let (a, v) ← f ms e
@@ -332,16 +358,15 @@ where
     | .mdata m b => go (m :: ms) b num fvars
     | _ => do
       if num != 0 then
-        have: MonadExceptOf MessageData (FormatT MetaM) := instMonadExceptOfExceptTOfMonad _ _
         throw m!"not enough type parameters when handling eager implicits: {num.succ} still needed of {skip}: at {e}"
       f ms e
 
-def formatArgsWithEagerImplicits [MonadLiftT IO M]
+def formatArgsWithEagerImplicits
     (ty: DedupedExpr) (f: Nat → Nat) (e: ProcessedExpr) : M ((Array ((Option BinderInfo) × String)) × PFormat) := do
   formatArgsAndHandleExpr e λ ms e d ↦ do
     let (a, e) ← formatEagerImplicitsAndHandleExpr ty.deduped (f d) λ _ _ ↦ do
       pure (Array.empty, ← formatExprInner ms e)
-    (a, app e (a.toList.map (λ (bi, s) ↦ encloseWith (maybeLotBinderSeps bi) (token s))))
+    pure <| (a, app e (a.toList.map (λ (bi, s) ↦ encloseWith (maybeLotBinderSeps bi) (token s))))
 
 def substTypeParams
     [Inhabited α] (mdatas: List MData) (e : Expr) (typeValues: Array String) (f: List MData → Expr → M α): M α := do

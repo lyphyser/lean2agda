@@ -9,7 +9,7 @@ open Batteries (Vector)
 open Lean (Expr MData Level MessageData Name Environment)
 open Std (HashMap)
 
-variable {M: Type → Type} [Monad M] [MonadExceptOf MessageData M]
+local macro "M": term => `(Except MessageData)
 
 structure BoundLevels where
   constInstance: ConstInstance
@@ -34,7 +34,7 @@ def resolveSimplifiedLevelClause (ci: ConstInstance)
     throw m!"Unable to decide whether dependent const level clause {c.toArray.map (·.val)} is always nonzero or zero: level clause generation or level resolution is buggy!"
 
 /- apply the fact that e.g. if we know that u OR v != 0, then max(u + 3, v + 6, ...) >= 4, so rewrite the const in the max accordingly -/
-def applyNonZeroClauses
+private def applyNonZeroClauses
   (ci: ConstInstance) (ml: MaxLevel ci.numLevels): MaxLevel ci.numLevels :=
   let {params, const} := ml
 
@@ -86,3 +86,12 @@ where
       else
         modify (·.maxConst add)
     | .mvar _ => throw m!"unexpected mvar in level"
+
+def boundLevels
+  (ci: ConstInstance) (levelParamValues: Vector Name ci.numLevels): BoundLevels :=
+
+  let h: levelParamValues.toArray.size = ci.constAnalysis.numLevels := by
+    exact levelParamValues.size_eq
+  let input2idx := h ▸ reverseHashMap levelParamValues.toArray id id
+
+  {constInstance := ci, input2idx}

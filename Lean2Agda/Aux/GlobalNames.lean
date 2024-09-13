@@ -21,11 +21,8 @@ structure GlobalNames where
   nameReplacements: HashMap Name String := {}
   deriving Inhabited
 
-genSubMonad (GlobalNames) (HygienicNames) hygienicNames hygienicNames
-
-variable {M: Type → Type} [Monad M] [MonadExceptOf MessageData M]
-   [Value Language] [Value DedupData]
-   [MonadStateOf GlobalNames M]
+variable [Value Language] [Value DedupData]
+local macro "M": term => `(EStateM MessageData GlobalNames)
 
 def stringifyUnqualifiedName
   (p: Name) (name : Name) {numLevelClauses: Nat} (levelInstance: LevelInstance numLevelClauses): M String := do
@@ -40,7 +37,7 @@ def stringifyUnqualifiedName
   if dot == '.' then
     pure s
   else
-    stringifyIdent s
+    pure <| stringifyIdent s
 where
   toName (p: Name) (n: Name) (suffix: String): M String := do
     if n == p then
@@ -50,12 +47,13 @@ where
       | .anonymous => throw m!"qualified name is not in expected namespace"
       | .str v "_@" =>
         let v := s!"{v}"
-        let r ← makeHygienicName v pure
-        modifyThe GlobalNames λ {hygienicNames, nameReplacements} ↦ {hygienicNames, nameReplacements := nameReplacements.insert name r}
-        pure r
+        let hn := makeHygienicName v
+        modifyGetThe GlobalNames λ {hygienicNames, nameReplacements} ↦
+          let (r, hygienicNames) := hn.permanentFn hygienicNames
+          (r, {hygienicNames, nameReplacements := nameReplacements.insert name r})
       | .str n s =>
         let s ← if dot == '.' then
-          stringifyIdent s
+          pure <| stringifyIdent s
         else
           pure s
         toNameDot p n s!"{s}{suffix}"
@@ -82,7 +80,7 @@ def nameToArray
 where go (n: Name) (a: Array String): M (Array String) := do
   match n with
   | .anonymous => pure a
-  | .str n s => go n (a.push (← stringifyIdent s))
+  | .str n s => go n (a.push (stringifyIdent s))
   | .num n i => go n (a.push s!"{intPrefix}{i}")
 
 def declarationName

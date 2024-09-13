@@ -16,56 +16,56 @@ structure ExprState where
 
 genSubMonad (ExprState) (HygienicNames) hygienicNames hygienicNames
 
-variable {M: Type → Type} [Monad M] [MonadExceptOf MessageData M]
-  [MonadStateOf ExprState M] [Value Language]
+variable [Value Language]
+
+section
+local macro "M": term => `(Except MessageData)
 
 def withLocalName
-  {α: Type} [Inhabited α] (name : Name) (pattern: Bool) (f: String → M α): M α :=
-  go name false f
+  (name : Name) (pattern: Bool): M (SubState ExprState String) :=
+  go name false
 where
-  go (n: Name) (inside: Bool) (f: String → M α): M α := do
+  go (n: Name) (inside: Bool): M (SubState ExprState String) :=
     match n with
     | .anonymous =>
       if inside then
         throw m!"unexpected local name {name}"
       else
-        f "_"
+        pure <| SubState.mkPure "_"
     | .str Name.anonymous v => do
       if inside then
         throw m!"unexpected local name {name}"
       else if pattern then
-        let h <- modifyGet (fun s =>
-          let h := s.patternNames.getD v 0
-          (h, {s with patternNames := s.patternNames.insert v (h + 1)})
-        )
-        let r ← f s!"{← stringifyIdent v}{if h == 0 then "" else if h == 1 then "#" else s!"#{h - 1}"}"
-        modify fun s => {s with patternNames := if h == 0 then
-            s.patternNames.erase v
-          else
-            s.patternNames.insert v h
-        }
-        pure r
+        let enter := λ ({bvarValues, patternNames, hygienicNames}: ExprState) ↦
+          let h := patternNames.getD v 0
+          let i := s!"{stringifyIdent v}{if h == 0 then "" else if h == 1 then "#" else s!"#{h - 1}"}"
+          ((i, h), ({patternNames := patternNames.insert v (h + 1), bvarValues, hygienicNames}: ExprState))
+        let exit := λ h ({bvarValues, patternNames, hygienicNames}: ExprState) ↦
+          ({bvarValues, hygienicNames, patternNames :=
+            (if h == 0 then
+              patternNames.erase v
+            else
+              patternNames.insert v h)
+          } : ExprState)
+        pure <| SubState.mk enter exit
       else
-        f (← stringifyIdent v)
+        pure <| SubState.mkPure (stringifyIdent v)
     | .str v "_@" => do
       let v := s!"{v}"
-      makeHygienicName v f
-    | .str n _ => go n true f
-    | .num n _ => go n true f
+      pure <| makeHygienicName v
+    | .str n _ => go n true
+    | .num n _ => go n true
 
-def bindStr
-  {α: Type} [Inhabited α] (n: String) (e: M α): M (String × α) := do
-  modify fun s => {s with bvarValues := s.bvarValues.push n }
-  let v <- e
-  modify fun s => {s with bvarValues := s.bvarValues.pop }
-  return (n, v)
+def bindStr' (n: String): SubState ExprState String :=
+  let enter := λ {bvarValues, patternNames, hygienicNames} ↦ ((n, ()), {bvarValues := bvarValues.push n, patternNames, hygienicNames})
+  let exit := λ _ {bvarValues, patternNames, hygienicNames} ↦ {bvarValues := bvarValues.pop, patternNames, hygienicNames }
+  SubState.mk enter exit
 
-def bindIf
-  {α: Type} [Inhabited α] (pattern: Bool) (n: Name) (e: M α): M (String × α) := do
-  withLocalName n pattern (bindStr · e)
+def bindIf' (pattern: Bool) (n: Name): M (SubState ExprState String) := do
+  pure <| (← withLocalName n pattern).compose bindStr'
 
-def bind
-  {α: Type} [Inhabited α] (n: Name) (e: M α): M (String × α) :=
+def bind' (n: Name): M (SubState ExprState String) :=
   -- TODO: implement proper name liveness analysis
   --bindIf false n e
-  bindIf true n e
+  bindIf' true n
+end

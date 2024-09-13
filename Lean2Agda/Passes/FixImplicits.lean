@@ -1,6 +1,10 @@
+import Lean2Agda.Data.Monad
 import Lean.Meta.Basic
 
-variable {M : Type → Type} [Monad M] [MonadExceptOf MessageData M]
+open Lean (MessageData)
+open Lean.Meta (MetaM)
+
+local macro "M": term => `(ExceptT MessageData MetaM)
 
 open Lean
 
@@ -11,7 +15,7 @@ structure ExprTyStructEq where
 
 open Lean.Meta in
 /-- Correct implicitness of lambdas -/
-partial def fixExpr [MonadLiftT MetaM M] [MonadControlT MetaM M]
+partial def fixExpr
     (input : Expr)
     (expectedType : Option Expr )
     (usedLetOnly := false)
@@ -33,7 +37,7 @@ partial def fixExpr [MonadLiftT MetaM M] [MonadControlT MetaM M]
               withLocalDecl n' c' d' fun x =>
                 pure (some (b'.instantiate1 x), c')
             | _ =>
-              throw m!"pi type expected\nexpression: {indentExpr e}\nexpected type: {indentExpr ty}"
+              throwThe _ m!"pi type expected\nexpression: {indentExpr e}\nexpected type: {indentExpr ty}"
               pure (none, c)
           withLocalDecl n c (← visit (d.instantiateRev fvars) none) fun x =>
             visitLambda (fvars.push x) b bt
@@ -61,7 +65,7 @@ partial def fixExpr [MonadLiftT MetaM M] [MonadControlT MetaM M]
         match ← whnf (← inferType f) with
           | .forallE _ d _ _ =>
             ft := some d
-          | _ => throw m!"function expected: {indentExpr e}"
+          | _ => throwThe _ m!"function expected: {indentExpr e}"
         let b := ← visit b ft
         pure <| e.updateApp! f b
       | .mdata _ b => pure <| e.updateMData! (← visit b ty)

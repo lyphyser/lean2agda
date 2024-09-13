@@ -1,16 +1,22 @@
 import Lean2Agda.Data.Value
+import Lean2Agda.Data.Monad
 import Lean2Agda.Analysis.ConstAnalysis
 import Lean2Agda.Aux.ConstInstance
 import Lean2Agda.Aux.ModulesState
 import Lean2Agda.Aux.Dependencies
 import Lean2Agda.Aux.ProcessedExpr
 import Lean2Agda.Main.FormatExpr
-import Lean2Agda.Passes.FixAndDedup
+import Lean2Agda.Passes.FixImplicits
+import Lean2Agda.Passes.Dedup
 
 import Lean.Declaration
+import Batteries.Data.Vector.Basic
+import Lake.Util.EStateT
 
+open Batteries (Vector)
 open Std (HashSet)
 open Lean (Name Expr Environment MessageData ConstantVal InductiveVal RecursorVal)
+open Lake (EStateT)
 
 private def numImplicitParams (e: Expr) :=
   go e 0
@@ -22,19 +28,66 @@ where
       | .mdata _ e => go e n
       | _ => n
 
+def TranslateOutput (M: Type → Type) := (Array (Name × GenLevelInstance)) × M Unit
+
+instance [Monad M]: Inhabited (TranslateOutput M) := ⟨⟨Array.empty, pure ()⟩⟩
+
 structure Visited where
   visitedConstants : HashSet (Name × GenLevelInstance) := {}
   deriving Inhabited
 
-variable {M: Type → Type} [Monad M] [MonadExceptOf MessageData M]
+structure TranslateState where
+  env : Environment
+  modulesState : ModulesState := default
+  dedupState : DedupState := {}
+  globalNames : GlobalNames := {}
+  globalAnalysis: GlobalAnalysis := {}
+  visited: Visited := {}
 
-variable [MonadLiftT IO M]
-  [MonadStateOf GlobalAnalysis M] [MonadStateOf GlobalNames M] [MonadStateOf Visited M] [MonadStateOf Environment M] [MonadStateOf DedupState M] [MonadStateOf ModulesState M]
-  [Value Language] [Value DedupData] [Value AnnotateContext] [Value EraseContext] [Value DedupConfig] [Value MetaMContext]
+genSubMonad (TranslateState) (GlobalAnalysis) globalAnalysis globalAnalysis
+genSubMonad (TranslateState) (GlobalNames) globalNames globalNames
+genSubMonad (TranslateState) (DedupState) dedupState dedupState
+genSubMonad (TranslateState) (Visited) visited visited
+genSubMonad (TranslateState) (ModulesState) modulesState modulesState
 
-def TranslateOutput (M: Type → Type) := (Array (Name × GenLevelInstance)) × M Unit
+instance {M: Type → Type} [Monad M] [base: MonadStateOf TranslateState M] [Value DummyEnvironment]: MonadStateOf Environment M where
+    get := do pure (← base.get).env
+    modifyGet f := do
+      let dummy := (valueOf DummyEnvironment).dummyEnv
+      pure (← base.modifyGet (λ σ ↦
+        let v := σ.env
+        let σ := {σ with env := dummy}
+        let (r, σ') := f v
+        (r, {σ with env := σ'})
+      ))
+    set σ' := base.modifyGet (λ σ ↦ ((), {σ with env := σ'}))
 
-instance: Inhabited (TranslateOutput M) := ⟨⟨Array.empty, pure ()⟩⟩
+abbrev TranslateT := EStateT MessageData TranslateState
+
+local macro "M": term => `(TranslateT IO)
+
+variable [Value Language] [Value DedupData] [Value AnnotateContext] [Value EraseContext] [Value DedupConfig] [Value MetaMContext]
+
+def fixAndDedupExprsFor
+  [Value MetaMContext] [Value DedupConfig]
+    (name: Name) (es: Array (Expr × Option Expr × Option Preserve)): M (Array DedupedExpr) := do
+  if isDedupConst name then
+    pure <| es.map ({ deduped := ·.1 })
+  else
+    runMetaMMod DedupState do
+      -- TODO: pass the type to dedupExprs so we might save some type inference
+      let es ← es.mapM (λ (e, ty, preserve) ↦ do pure (⟨← fixExpr e ty, preserve⟩ : (_ × _)))
+      dedupExprs es
+
+def processExprAnd
+    (constInstance: ConstInstance) (levelParams: Vector Name constInstance.constAnalysis.numLevels) (e : DedupedExpr) (keep: Nat) (f: [Value BoundLevels] → [Value AnnotationData] → ProcessedExpr → FormatT IO α): StateT Dependencies M α := do
+  have := ← getTheValue Environment
+  let (e, annotationData) ← processExpr constInstance levelParams e keep
+
+  StateT.run' (s := ({} : ExprState)) do
+    have := mkValue annotationData
+    have := mkValue <| boundLevels e.constInstance e.erased.levelParams
+    liftM (f e)
 
 def afterDependencies (deps: Dependencies) (m: M Unit): TranslateOutput M :=
   let deps := deps.dependencies.toArray.qsort (Ordering.isLT $ compare · ·)
@@ -233,8 +286,8 @@ def translateDef
     else
       match v with
       | some v => do
-        let mut (a, b) ← processExprAnd constInstance constInstance.levelParams v 0 <|
-          formatArgsWithEagerImplicits ty (·)
+        let mut (a, b) ← processExprAnd constInstance constInstance.levelParams v 0 λ e ↦ do
+          formatArgsWithEagerImplicits ty id e
         --let (typeParams, _) <- processExprAnd constInstance val.levelParams levelKinds ty a.size fun processedType => do
         --  formatParamsAndHandleExpr processedType a.size false (λ _ _ _ ↦ pure ())
         --for i in [0:typeParams.size.min a.size] do
@@ -289,27 +342,25 @@ def translateConstant'
   modifyThe Visited λ ({visitedConstants}) ↦ {visitedConstants := visitedConstants.insert (c, levelInstance) }
   pure r
 
-variable (M) in
 inductive QueueItem
 | const (c: Name) (levelInstance: GenLevelInstance)
 | out (m: M Unit)
 
 @[noinline, nospecialize]
-partial def translateConstantQueue (a: Array (QueueItem M)) (e: Option (TranslateOutput M)): M Unit := do
+partial def translateConstantQueue (a: Array QueueItem) (e: Option (TranslateOutput M)): M Unit := do
   let a := match e with
   | .some (deps, out) =>
     let depsItems := deps.map fun (n, levelInstance) => QueueItem.const n levelInstance
     (a.push (.out out)).append depsItems.reverse
   | .none => a
 
-  let item := a.back?
-  match item, a.pop with
-  | .none, _ => pure ()
-  | .some (.const c levelInstance), a =>
+  match a.backPop? with
+  | .none => pure ()
+  | .some ((.const c levelInstance), a) =>
     match ← translateConstant' c levelInstance with
     | .some e => translateConstantQueue a e
     | .none => throw m!"attempted to reference constant {c} with impossible level instance {levelInstance}!"
-  | .some (.out m), a =>
+  | .some ((.out m), a) =>
     m
     translateConstantQueue a none
 

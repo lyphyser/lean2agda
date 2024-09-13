@@ -9,8 +9,7 @@ structure Dependencies where
   dependencies: HashSet (Name × GenLevelInstance) := {}
   deriving Inhabited
 
-variable {M} [Monad M]
-  [MonadStateOf Dependencies M]
+local macro "M": term => `(StateM Dependencies)
 
 def addDependency
   (n: Name) (levelInstance: GenLevelInstance): M Unit := do

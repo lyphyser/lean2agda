@@ -22,36 +22,24 @@ namespace ProcessedExpr
 abbrev numLevels (e: ProcessedExpr) := e.constInstance.constAnalysis.numLevels
 end ProcessedExpr
 
-variable {M: Type → Type} [Monad M] [MonadExceptOf MessageData M]
-  [Value EraseContext] [Value AnnotateContext] [Value MetaMContext] [Value Environment]
+variable [Value EraseContext] [Value AnnotateContext] [Value MetaMContext] [Value Environment]
 
-def bindLevelParamsWith [MonadLiftT IO M]
-  {α: Type} (ci: ConstInstance) (levelParamValues: Vector Name ci.numLevels) (m: [Value BoundLevels] → M α): M α := do
+section
+local macro "M": term => `(ExceptT MessageData IO)
 
-  let h: levelParamValues.toArray.size = ci.constAnalysis.numLevels := by
-    exact levelParamValues.size_eq
-  let input2idx := h ▸ reverseHashMap levelParamValues.toArray id id
-
-  let r: BoundLevels := {constInstance := ci, input2idx}
-  --traceComment s!"BoundLevels: {repr r}"
-  have := mkValue r
-  m
-
-def processExprAnd [MonadStateOf Environment M] [MonadLiftT IO M]
-    (constInstance: ConstInstance) (levelParams: Vector Name constInstance.constAnalysis.numLevels) (e : DedupedExpr) (keep: Nat) (f: [Value BoundLevels] → [Value AnnotationData] → ProcessedExpr → StateT ExprState M α): M α := do
+def processExpr
+    (constInstance: ConstInstance) (levelParams: Vector Name constInstance.constAnalysis.numLevels) (e : DedupedExpr) (keep: Nat): M (ProcessedExpr × AnnotationData) := do
   let e := e.deduped
 
   have: MonadStateOf Unit M := unitStateOf
-  let (e, annotationData) <- runMetaMRo Unit do
-    StateT.run (s := ({} : AnnotationData)) do
-      annotateExpr (ε := MessageData) e
+  let (e, annotationData) ← StateT.run (s := ({} : AnnotationData)) do
+    runMetaMRo AnnotationData do
+      annotateExpr e
 
   -- this must happen last, because it can make the Expr invalid due to erasing lambda types
   let e: ProcessedExpr := {
       constInstance,
       erased := eraseUnused (valueOf EraseContext) annotationData levelParams e keep
     }
-  StateT.run' (s := ({} : ExprState)) do
-    have := mkValue annotationData
-    bindLevelParamsWith e.constInstance e.erased.levelParams do
-      f e
+  pure (e, annotationData)
+end

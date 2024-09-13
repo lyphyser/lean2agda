@@ -16,9 +16,8 @@ def myPretty (f : Format) (width : Nat := 150) (indent : Nat := 0) (column := 0)
   let act : StateM PrettyState Unit := _root_.prettyM f width indent
   PrettyState.out <| act (PrettyState.mk "" column {} 0) |>.snd
 
-variable {M: Type → Type} [Monad M] [MonadLiftT IO M]
-
 section
+local macro "M": term => `(IO)
 variable [Value ModuleState]
 
 open Std.Format in
@@ -56,9 +55,9 @@ def outputModulePrelude: M Unit := do
   println "lone = lsuc lzero"
 end
 
-variable [MonadStateOf ModuleState M]
-
 def useBrokenNamespaceModules := false
+
+local macro "M": term => `(StateT ModuleState IO)
 
 def goToNamespace
   (a : Array String) : M Unit := do

@@ -34,9 +34,9 @@ end
 def ModulesState := Option ModuleState
   deriving Inhabited
 
-variable {M: Type → Type} [Monad M] [MonadLiftT IO M]
+local macro "M": term => `(StateT ModulesState IO)
 
-def getOrOpenOutputModuleForConst [MonadStateOf ModulesState M]
+def getOrOpenOutputModuleForConst
   (_ci: ConstAnalysis): M ModuleState := do
   match ← getThe ModulesState with
   | .some ms => pure ms

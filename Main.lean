@@ -28,6 +28,6 @@ def main (args : List String) : IO Unit := do
     | some cs => cs.map fun c => Syntax.decodeNameLit ("`" ++ c) |>.get!
     | none    => env.constants.toList.map Prod.fst |>.filter (!·.isInternal)
 
-  M.run options.toConfig env do
+  TranslateM.run options.toConfig env do
     for c in constants do
       let _ ← translateConstantVariants c

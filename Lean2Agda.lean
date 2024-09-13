@@ -21,16 +21,16 @@ import Lean
 import Lean.CoreM
 import Lean.Meta.Basic
 import Lean.Meta.InferType
+import Lake.Util.EStateT
 import Batteries.Data.Vector.Basic
 import Std.Data.HashMap.Basic
 import Std.Data.HashSet.Basic
 
 open System (FilePath)
-open Lean hiding HashMap HashSet
+open Lean (Environment Options Name KVMap mkEmptyEnvironment)
+open Lake (EStateT EResult)
 open Batteries (Vector)
 open Std (HashMap HashSet)
-
-variable {M : Type → Type} [Monad M] [MonadExceptOf MessageData M]
 
 structure Config extends EraseConfig where
   options: Options := {}
@@ -44,39 +44,8 @@ genSubValue (Context) (EraseContext) toEraseContext
 genSubValue (Context) (DedupConfig) toDedupConfig
 genSubValue (Context) (Language) language
 
-structure State where
-  env : Environment
-  modulesState : ModulesState := default
-  dedupState : DedupState := {}
-  globalNames : GlobalNames := {}
-  globalAnalysis: GlobalAnalysis := {}
-  visited: Visited := {}
-
-genSubMonad (State) (GlobalAnalysis) globalAnalysis globalAnalysis
-genSubMonad (State) (GlobalNames) globalNames globalNames
-genSubMonad (State) (DedupState) dedupState dedupState
-genSubMonad (State) (Visited) visited visited
-genSubMonad (State) (ModulesState) modulesState modulesState
-
-instance [base: MonadStateOf State M] [Value Context]: MonadStateOf Environment M where
-    get := do pure (← base.get).env
-    modifyGet f := do
-      let dummy := (valueOf Context).dummyEnv
-      pure (← base.modifyGet (λ σ ↦
-        let v := σ.env
-        let σ := {σ with env := dummy}
-        let (r, σ') := f v
-        (r, {σ with env := σ'})
-      ))
-    set σ' := base.modifyGet (λ σ ↦ ((), {σ with env := σ'}))
-
-abbrev OurT.{v} (m: Type → Type v): Type → Type v :=
-  (ExceptT MessageData (StateT _root_.State m))
-
-abbrev OurM := OurT IO
-
-def M.run
-  (config : Config) (env : Environment) (act : [Value Context] → OurM α) : IO α := do
+def TranslateM.run
+  (config : Config) (env : Environment) (act : [Value Context] → TranslateT IO α) : IO α := do
   let rand := (String.mk $ ← (List.replicate 16 ' ').mapM fun _ => do pure $ Char.ofNat $ ← IO.rand 33 126)
   let projectKeyword := Name.str Name.anonymous ("$$project_" ++ rand)
   let implicitKeyword := Name.str Name.anonymous ("$$implicit_" ++ rand)
@@ -86,10 +55,9 @@ def M.run
   let language := Agda
 
   have := mkValueAs Context { config with dummyEnv, projectKeyword, implicitKeyword, binderMDatas, dedupPrefix, language}
-  let r ← StateT.run' (s := ({ env } : _root_.State)) do
-      ExceptT.run do
-        act
+  let r ← EStateT.run ({ env } : TranslateState) do
+    act
 
   match r with
-  | Except.error msg => throw <| IO.userError (← msg.toString)
-  | Except.ok a => pure a
+  | .error msg _ => throw <| IO.userError (← msg.toString)
+  | .ok a _ => pure a

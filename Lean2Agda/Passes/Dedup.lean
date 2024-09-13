@@ -7,12 +7,11 @@ import Lean.AddDecl
 import Std.Data.HashMap.Basic
 
 open Lean hiding HashMap HashSet
+open Lake (EStateT EResult)
 open Std (HashMap)
 
 local instance [Repr α]: ToFormat α where
   format := repr
-
-variable {M : Type → Type} [Monad M] [MonadExceptOf MessageData M]
 
 structure DedupData where
   dedupPrefix: Name
@@ -42,10 +41,12 @@ structure Preserve where
 
 def DedupRunState := HashMap ExprStructEq (Option Expr)
 
+local macro "M": term => `(EStateT MessageData DedupState MetaM)
+local macro "M'": term => `(EStateT MessageData DedupRunState MetaM)
+
 partial def dedupExprs [Value DedupConfig]
-    [MonadStateOf DedupState M] [MonadLiftT MetaM M]
     (es: Array (Expr × Option Preserve)): M (Array DedupedExpr) := do
-  let extract {M: Type → Type} [Monad M] [MonadStateOf DedupState M] [MonadLiftT MetaM M]
+  let extract
       (e: Expr) (type: Expr): M Expr := do
     let idx ← modifyGetThe DedupState (λ {map, numConsts} ↦ (numConsts, {map, numConsts := numConsts.succ}))
     let name := Name.num (valueOf DedupConfig).dedupPrefix idx
@@ -72,8 +73,8 @@ partial def dedupExprs [Value DedupConfig]
 
     pure <| .const name (levelParams.map (.param ·))
 
-  let rec mark {M: Type → Type} [Monad M] [MonadStateOf DedupRunState M] [MonadLiftT MetaM M]
-      (e: Expr): M Unit := do
+  let rec mark
+      (e: Expr): M' Unit := do
     let cont ←
       if e.hasLooseBVars || e.approxDepth == 0 then -- TODO: support extracting exprs with loose bvars
         pure true
@@ -98,8 +99,8 @@ partial def dedupExprs [Value DedupConfig]
       | .proj _ _ b => do mark b
       | _ => pure ()
 
-  let rec markPreserve {M: Type → Type} [Monad M] [MonadExceptOf MessageData M] [MonadStateOf DedupRunState M] [MonadLiftT MetaM M]
-    (e: Expr) (p: PreserveKind) (n: Nat): M Unit := do
+  let rec markPreserve
+    (e: Expr) (p: PreserveKind) (n: Nat): M' Unit := do
     if n == 0 then
       mark e
     else
@@ -120,9 +121,8 @@ partial def dedupExprs [Value DedupConfig]
       | _ =>
         fail
 
-  let rec dedup {M: Type → Type} [Monad M] [MonadLiftT MetaM M]
-      [Value DedupRunState] [MonadStateOf DedupState M]
-      (e: Expr): M Expr := do
+  let rec dedup [Value DedupRunState]
+    (e: Expr): M Expr := do
     let replacement := (← get).map.get? e
     if let .some replacement := replacement then do
       pure <| replacement
@@ -143,8 +143,7 @@ partial def dedupExprs [Value DedupConfig]
       | _ =>
         pure <| e'
 
-  let rec dedupPreserve {M: Type → Type} [Monad M] [MonadExceptOf MessageData M] [MonadLiftT MetaM M]
-      [Value DedupRunState] [MonadStateOf DedupState M]
+  let rec dedupPreserve [Value DedupRunState]
       (e: Expr) (p: PreserveKind) (n: Nat): M Expr := do
     if n == 0 then
       dedup e
@@ -167,11 +166,13 @@ partial def dedupExprs [Value DedupConfig]
         fail
 
   let s: DedupRunState := HashMap.empty
-  let (_, s) := ← StateT.run (m := M) (s := s) do
+  let r: MetaM (EResult MessageData DedupRunState Unit) := EStateT.run s do
     es.forM λ (e, p) ↦ do
       match p with
       | .none => mark e
       | .some p => markPreserve e p.kind p.n
+  let (e, s) := (← r).toProd
+  liftM e
 
   have := mkValue s
   es.mapM λ (e, p) ↦ do
@@ -182,12 +183,12 @@ partial def dedupExprs [Value DedupConfig]
     }
 
 def isDedupConst [Value DedupConfig]
-    (name: Name): M Bool := do
-  let needed ← match name with
+    (name: Name): Bool :=
+  match name with
   | .num p _ =>
     if p == (valueOf DedupConfig).dedupPrefix then
-      return true
+      true
     else
-      pure false
+      false
   | _ =>
-    pure false
+    false
