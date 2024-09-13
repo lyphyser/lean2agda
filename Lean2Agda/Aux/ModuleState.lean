@@ -24,7 +24,7 @@ open Std.Format in
 def outputIndented
   (levels: Nat) (f: PFormat): M Unit := do
   let self := valueOf ModuleState
-  self.output.putStr <| (myPretty <| nest (self.indentSpace + levels * indentOneLevelSpaces) <| (text "\n") ++ (resolveWithPrec f .bottom)) ++ "\n"
+  self.output.putStr <| (myPretty <| nest (self.indentSpace + levels * indentOneLevelSpaces) <| (text "\n") ++ (resolveAtBottom f)) ++ "\n"
 
 def output
   (f: PFormat): M Unit := do

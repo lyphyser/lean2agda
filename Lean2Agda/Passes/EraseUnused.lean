@@ -15,7 +15,7 @@ structure EraseConfig where
 structure EraseContext extends EraseConfig where
   projectKeyword: Name
 
-structure EraseState where
+private structure EraseState where
   usedBVars: Array Bool := Array.empty
   usedLevels: HashSet Name := {}
 
@@ -25,6 +25,20 @@ structure ErasedExpr (numLevels: Nat) where
 
 instance (numLevels: Nat): Inhabited (ErasedExpr numLevels) :=
   ⟨{levelParams := Vector.mkVector numLevels Name.anonymous}⟩
+
+private def goLevel (l : Level) : StateM EraseState Unit :=
+  match l with
+  | .zero => pure ()
+  | .mvar _ => pure ()
+  | .succ lp => goLevel lp
+  | .max l1 l2 => do
+      goLevel l1
+      goLevel l2
+  | .imax l1 l2 => do
+      goLevel l1
+      goLevel l2
+  | .param n =>
+    modify fun s => {s with usedLevels := s.usedLevels.insert n}
 
 -- TODO: maybe should cache (but we now have dedup in front so...)
 def eraseUnused {numLevels: Nat} (ctx: EraseContext) (annotationData: AnnotationData) (levelParams: Vector Name numLevels) (e : Expr) (keep: Nat): ErasedExpr numLevels :=
@@ -91,19 +105,6 @@ where
       pure e
     | .lit .. | .mvar .. | .fvar .. =>
       pure e
-  goLevel (l : Level) : StateM EraseState Unit :=
-    match l with
-    | .zero => pure ()
-    | .mvar _ => pure ()
-    | .succ lp => goLevel lp
-    | .max l1 l2 => do
-        goLevel l1
-        goLevel l2
-    | .imax l1 l2 => do
-        goLevel l1
-        goLevel l2
-    | .param n =>
-      modify fun s => {s with usedLevels := s.usedLevels.insert n}
   bind (n: Name) (u: Nat) (b: Expr): StateM EraseState (Name × Expr) := do
     modify fun s => {s with usedBVars := s.usedBVars.push false}
     let b <- go b (u - 1)

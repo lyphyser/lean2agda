@@ -74,7 +74,7 @@ def stringifyGlobalName
   | .anonymous => throw m!"anonymous global name"
   | _ => stringifyUnqualifiedName Name.anonymous n levelInstance
 
-def nameToArray
+private def nameToArray
   (n : Name) : M (Array String) := do
   pure (← go n Array.empty).reverse
 where go (n: Name) (a: Array String): M (Array String) := do

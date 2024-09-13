@@ -56,6 +56,12 @@ def annotateApp
       throw ↑s!"unexpected function type {ft}"
   | _ => return e
 
+private def unwrap: Expr → Expr
+| .app f _ => unwrap f
+| .lam _ _ b _ => unwrap b
+| .mdata _ e => e
+| e => e
+
 open Lean.Meta in
 def annotateProj
     (e : Expr): M Expr := do
@@ -75,12 +81,6 @@ def annotateProj
       throw ↑s!"structType is not a const: {structType}"
       pure  e
   | _ => return e
-where
-  unwrap: Expr → Expr
-  | .app f _ => unwrap f
-  | .lam _ _ b _ => unwrap b
-  | .mdata _ e => e
-  | e => e
 
 def annotateExpr
   (e : Expr) : M Expr :=

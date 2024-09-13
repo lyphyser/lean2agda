@@ -8,7 +8,7 @@ local macro "M": term => `(ExceptT MessageData MetaM)
 
 open Lean
 
-structure ExprTyStructEq where
+private structure ExprTyStructEq where
   val : ExprStructEq
   ty : Option ExprStructEq
   deriving Inhabited, BEq, Hashable

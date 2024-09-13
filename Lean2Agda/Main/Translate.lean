@@ -15,7 +15,7 @@ import Lake.Util.EStateT
 
 open Batteries (Vector)
 open Std (HashSet)
-open Lean (Name Expr Environment MessageData ConstantVal InductiveVal RecursorVal)
+open Lean (BinderInfo Name Expr Environment MessageData ConstantVal ConstructorVal InductiveVal RecursorVal)
 open Lake (EStateT)
 
 private def numImplicitParams (e: Expr) :=
@@ -28,11 +28,11 @@ where
       | .mdata _ e => go e n
       | _ => n
 
-def TranslateOutput (M: Type → Type) := (Array (Name × GenLevelInstance)) × M Unit
+private def TranslateOutput (M: Type → Type) := (Array (Name × GenLevelInstance)) × M Unit
 
 instance [Monad M]: Inhabited (TranslateOutput M) := ⟨⟨Array.empty, pure ()⟩⟩
 
-structure Visited where
+private structure Visited where
   visitedConstants : HashSet (Name × GenLevelInstance) := {}
   deriving Inhabited
 
@@ -68,7 +68,7 @@ local macro "M": term => `(TranslateT IO)
 
 variable [Value Language] [Value DedupData] [Value AnnotateContext] [Value EraseContext] [Value DedupConfig] [Value MetaMContext]
 
-def fixAndDedupExprsFor
+private def fixAndDedupExprsFor
   [Value MetaMContext] [Value DedupConfig]
     (name: Name) (es: Array (Expr × Option Expr × Option Preserve)): M (Array DedupedExpr) := do
   if isDedupConst name then
@@ -79,7 +79,7 @@ def fixAndDedupExprsFor
       let es ← es.mapM (λ (e, ty, preserve) ↦ do pure (⟨← fixExpr e ty, preserve⟩ : (_ × _)))
       dedupExprs es
 
-def processExprAnd
+private def processExprAnd
     (constInstance: ConstInstance) (levelParams: Vector Name constInstance.constAnalysis.numLevels) (e : DedupedExpr) (keep: Nat) (f: [Value BoundLevels] → [Value AnnotationData] → ProcessedExpr → FormatT IO α): StateT Dependencies M α := do
   have := ← getTheValue Environment
   let (e, annotationData) ← processExpr constInstance levelParams e keep
@@ -89,11 +89,11 @@ def processExprAnd
     have := mkValue <| boundLevels e.constInstance e.erased.levelParams
     liftM (f e)
 
-def afterDependencies (deps: Dependencies) (m: M Unit): TranslateOutput M :=
+private def afterDependencies (deps: Dependencies) (m: M Unit): TranslateOutput M :=
   let deps := deps.dependencies.toArray.qsort (Ordering.isLT $ compare · ·)
   ⟨deps, m⟩
 
-def produceOutput (ci: ConstAnalysis) (deps: Dependencies) (ns: Array String) (m: [Value ModuleState] → M Unit): TranslateOutput M :=
+private def produceOutput (ci: ConstAnalysis) (deps: Dependencies) (ns: Array String) (m: [Value ModuleState] → M Unit): TranslateOutput M :=
   afterDependencies deps do
     let ms ← getOrOpenOutputModuleForConst ci
     let (_, ms) ← StateT.run (s := ms) do
@@ -101,7 +101,57 @@ def produceOutput (ci: ConstAnalysis) (deps: Dependencies) (ns: Array String) (m
     have := mkValue ms
     m
 
-def translateInductive (c: Name) (constInstance: ConstInstance) (ns: Array String) (n: String) (val: InductiveVal): M (TranslateOutput M) := do
+private def translateRecord (constInstance: ConstInstance) (deps: Dependencies) (ns: Array String) (n: String) (val: InductiveVal)
+  (typeParams : Array (Option BinderInfo × String × PFormat)) (type: PFormat) (info: String)
+  (ctor: ConstructorVal) (fields: Array (Option BinderInfo × String × PFormat))
+  : M (TranslateOutput M) := do
+  pure <| produceOutput constInstance.constAnalysis deps ns do
+    nlprintln s!"--record {info}"
+    output $ andWhere (typing (parameterized (kwToken "record" n) (formatParams typeParams).data) type)
+
+    let name ← if dot != '.' then
+      stringifyGlobalName ctor.name constInstance.levelInstance
+    else
+      stringifyUnqualifiedName val.name ctor.name constInstance.levelInstance
+
+    if val.isRec then
+      outputIndented 1 $ token "inductive"
+    outputIndented 1 $ kwToken "constructor" name
+
+    if !fields.isEmpty then
+      outputIndented 1 $ token "field"
+      fields.forM fun ⟨bi, n, t⟩ => do
+        outputIndented 2 $ typing (encloseWith (maybeLotBinderSeps bi) (token n)) t
+
+private def translateData [Value Environment] (constInstance: ConstInstance) (deps: Dependencies) (ns: Array String) (n: String) (val: InductiveVal)
+  (typeParams : Array (Option BinderInfo × String × PFormat)) (type: PFormat) (info: String)
+  (ctors : Array ConstructorVal) (ctorTypes : Array DedupedExpr) (typeValues : Array String)
+
+  : M (TranslateOutput M) := do
+  let (ctorExprs, deps) ← StateT.run (s := deps) do
+    --(ctors.zip ctorTypes).mapM fun (ctor, ctorType) => do
+    ctorTypes.mapM fun ctorType => do
+      -- levelParams was []
+      processExprAnd constInstance constInstance.levelParams ctorType 0 fun e => do
+        substTypeParams [] e.erased.expr typeValues formatExprInner
+
+  pure <| produceOutput constInstance.constAnalysis deps ns do
+    nlprintln s!"--inductive {info}"
+    output $ andWhere (typing (parameterized (kwToken "data" n) (formatParams typeParams).data) type)
+
+    (ctors.zip ctorExprs).forM fun (ctor, expr) => do
+      --println s!"--ctor {ctor.numParams} {ctor.numFields}"
+      let name ← if dot != '.' then
+        stringifyGlobalName ctor.name constInstance.levelInstance
+      else
+        stringifyUnqualifiedName val.name ctor.name constInstance.levelInstance
+      outputIndented 1 $
+        typing (token name) expr
+
+    if val.name == `Nat then
+      nlprintln "{-# BUILTIN NATURAL Nat #-}"
+
+private def translateInductive (c: Name) (constInstance: ConstInstance) (ns: Array String) (n: String) (val: InductiveVal): M (TranslateOutput M) := do
   let ctors <- val.ctors.toArray.mapM fun ctor => do match ((← getThe Environment).find? ctor |>.get!) with
     | .ctorInfo ctor => pure ctor
     | _ => throw m!"inductive ctor is not a ctor"
@@ -141,52 +191,15 @@ def translateInductive (c: Name) (constInstance: ConstInstance) (ns: Array Strin
     | _, _ =>
       pure none
 
+  let info := s!"{val.levelParams.length} {val.numParams}->{fixedNumParams} {val.numIndices} {typeParams.size}"
+
   match record with
   | .some (ctor, fields) => do
-
-    pure <| produceOutput constInstance.constAnalysis deps ns do
-      nlprintln s!"--record {val.levelParams.length} {val.numParams}->{fixedNumParams} {val.numIndices} {typeParams.size}"
-      output $ andWhere (typing (parameterized (kwToken "record" n) (formatParams typeParams).data) type)
-
-      let name ← if dot != '.' then
-        stringifyGlobalName ctor.name constInstance.levelInstance
-      else
-        stringifyUnqualifiedName val.name ctor.name constInstance.levelInstance
-
-      if val.isRec then
-        outputIndented 1 $ token "inductive"
-      outputIndented 1 $ kwToken "constructor" name
-
-      if !fields.isEmpty then
-        outputIndented 1 $ token "field"
-        fields.forM fun ⟨bi, n, t⟩ => do
-          outputIndented 2 $ typing (encloseWith (maybeLotBinderSeps bi) (token n)) t
-
+    translateRecord constInstance deps ns n val typeParams type info ctor fields
   | .none =>
-    let (ctorExprs, deps) ← StateT.run (s := deps) do
-      --(ctors.zip ctorTypes).mapM fun (ctor, ctorType) => do
-      ctorTypes.mapM fun ctorType => do
-        -- levelParams was []
-        processExprAnd constInstance constInstance.levelParams ctorType 0 fun e => do
-          substTypeParams [] e.erased.expr typeValues formatExprInner
+    translateData constInstance deps ns n val typeParams type info ctors ctorTypes typeValues
 
-    pure <| produceOutput constInstance.constAnalysis deps ns do
-      nlprintln s!"--inductive {val.levelParams.length} {val.numParams}->{fixedNumParams} {val.numIndices} {typeParams.size}"
-      output $ andWhere (typing (parameterized (kwToken "data" n) (formatParams typeParams).data) type)
-
-      (ctors.zip ctorExprs).forM fun (ctor, expr) => do
-        --println s!"--ctor {ctor.numParams} {ctor.numFields}"
-        let name ← if dot != '.' then
-          stringifyGlobalName ctor.name constInstance.levelInstance
-        else
-          stringifyUnqualifiedName val.name ctor.name constInstance.levelInstance
-        outputIndented 1 $
-          typing (token name) expr
-
-      if val.name == `Nat then
-        nlprintln "{-# BUILTIN NATURAL Nat #-}"
-
-def translateFun [Value Environment]
+private def translateFun [Value Environment]
     (constInstance: ConstInstance)
     (deps: Dependencies) (ns: Array String) (s: String) (n: String) (kw: Option String) (ty: DedupedExpr) (cases: List PFormat): M (TranslateOutput M) := do
   let (ty, deps) ← StateT.run (s := deps) do
@@ -207,7 +220,7 @@ def translateFun [Value Environment]
     cases.forM fun s => do
       output s
 
-def translateRecursor (c: Name) (constInstance: ConstInstance) (ns: Array String) (n: String) (val: RecursorVal): M (TranslateOutput M) := do
+private def translateRecursor (c: Name) (constInstance: ConstInstance) (ns: Array String) (n: String) (val: RecursorVal): M (TranslateOutput M) := do
   let ctors <- val.rules.mapM fun rule => do match ((← getThe Environment).find? rule.ctor |>.get!) with
     | .ctorInfo ctor => pure ctor
     | _ => throw m!"inductive ctor is not a ctor"
@@ -265,7 +278,7 @@ def translateRecursor (c: Name) (constInstance: ConstInstance) (ns: Array String
 
   translateFun constInstance deps ns s!"recursor {val.numParams}->{fixedNumParams} {val.numIndices}->{fixedNumIndices} {val.numMotives} {val.numMinors}" n p ty cases
 
-def translateDef
+private def translateDef
     (c: Name) (constInstance: ConstInstance)
     (m: Array String) (s: String) (n: String) (val: ConstantVal) (v: Option Expr) : M (TranslateOutput M) := do
   --dbg_trace s!"dumpDef {c} {val.levelParams} {levelKinds} {v}"
@@ -299,8 +312,7 @@ def translateDef
 
   translateFun constInstance deps m s n p ty cases
 
-@[noinline, nospecialize]
-def translateConstant'
+private def translateConstant'
   (c : Name) (levelInstance: GenLevelInstance): M (Option (Option (TranslateOutput M))) := do
   if (← getThe Visited).visitedConstants.contains (c, levelInstance) then
     return some none
@@ -342,12 +354,11 @@ def translateConstant'
   modifyThe Visited λ ({visitedConstants}) ↦ {visitedConstants := visitedConstants.insert (c, levelInstance) }
   pure r
 
-inductive QueueItem
+private inductive QueueItem
 | const (c: Name) (levelInstance: GenLevelInstance)
 | out (m: M Unit)
 
-@[noinline, nospecialize]
-partial def translateConstantQueue (a: Array QueueItem) (e: Option (TranslateOutput M)): M Unit := do
+private partial def translateConstantQueue (a: Array QueueItem) (e: Option (TranslateOutput M)): M Unit := do
   let a := match e with
   | .some (deps, out) =>
     let depsItems := deps.map fun (n, levelInstance) => QueueItem.const n levelInstance
@@ -364,7 +375,7 @@ partial def translateConstantQueue (a: Array QueueItem) (e: Option (TranslateOut
     m
     translateConstantQueue a none
 
-@[noinline, nospecialize]
+@[nospecialize, noinline]
 def translateConstant
   (c : Name) (levelInstance: GenLevelInstance): M (Option Unit) := do
   match ← translateConstant' c levelInstance with
@@ -374,7 +385,7 @@ def translateConstant
     translateConstantQueue #[] x
     pure <| some ()
 
-@[noinline, nospecialize]
+@[nospecialize, noinline]
 partial def translateConstantVariants
   (c : Name): M Unit := do
   let constAnalysis ← (

@@ -73,7 +73,12 @@ def bind {α: Type} [Inhabited α] (n: Name) (e: M α): M (String × α) := do
 def bindMM {α: Type} [Inhabited α] (n: Name) (e: (FormatT MetaM) α): (FormatT MetaM) (String × α) := do
   (← bind' n).withMe λ n ↦ do pure (n, ← e)
 
-def formatLevel
+private def lparam: Name → M PFormat
+| .anonymous => pure $ token $ "_"
+| .str Name.anonymous v => do pure $ token $ stringifyIdent v
+| n => throw m!"unexpected level name: {n}"
+
+private def formatLevel
   (ci: ConstInstance) (nl : NormLevel ci.numLevels): M PFormat := do
   let {add, max := {const, params}} := nl
 
@@ -94,15 +99,11 @@ def formatLevel
         | .some n => pure <| ladd padd <| ← lparam n
 
     pure <| ladd add (lmax es.toList)
-where
-  lparam: Name → M PFormat
-  | .anonymous => pure $ token $ "_"
-  | .str Name.anonymous v => do pure $ token $ stringifyIdent v
-  | n => throw m!"unexpected level name: {n}"
 
 --set_option trace.Meta.synthInstance true
 --set_option trace.Meta.isDefEq true
 
+@[nospecialize]
 def formatConst (n: Name) (us: Array Level) (f: String → String) (withLevels: Bool): M PFormat := do
   let constAnalysis ← getOrComputeConstAnalysis n
   let boundLevels := valueOf BoundLevels
@@ -124,6 +125,53 @@ def formatConst (n: Name) (us: Array Level) (f: String → String) (withLevels: 
   else
     pure c
 
+private def argName: Expr → Nat → M Name
+| .forallE n _ _ _, .zero => pure n
+| .forallE _ _ b _, .succ n => argName b n
+| .mdata _ e, n => argName e n
+| _, _ => throw m!"argument not found!"
+
+private def formatProj (mdatas: List MData) (typeName: Name) (idx: Nat): M PFormat := do
+  let projectKeyword := (valueOf AnnotateContext).projectKeyword
+  let projId: Option Nat := mdatas.findSome? (·.get? projectKeyword)
+  let .some projId := projId | throw m!"proj without our metadata: {mdatas}"
+  let projectionLevels: List Level := (valueOf AnnotationData).projectionLevels[projId]!
+
+  let env := valueOf Environment
+  let induct := env.find? typeName |>.get!
+  let .inductInfo induct := induct | throw m!"projection type is not an inductive"
+  let [ctor] := induct.ctors | throw m!"projection type is not an 1-ctor inductive"
+
+  let .ctorInfo ctor := (env.find? ctor |>.get!) | throw m!"inductive ctor is not a ctor"
+  let fieldName := ← argName ctor.type (ctor.numParams + idx)
+  let .str Name.anonymous fieldName := fieldName | throw m!"unexpected field name"
+
+  let fieldName := stringifyIdent fieldName
+  formatConst typeName projectionLevels.toArray (· ++ "." ++ fieldName) true
+
+private def formatSort (l: Level): M PFormat := do
+  let boundLevels := valueOf BoundLevels
+  let {add, max := {const, params}} := ← resolveLevel boundLevels l
+  if params.toArray.all (·.isNone) then
+    pure <| match add with
+    | 0 => token "Prop"
+    | 1 => token "Set₁"
+    | 2 => token "Set₂"
+    | 3 => token "Set₃"
+    | 4 => token "Set₄"
+    | 5 => token "Set₅"
+    | 6 => token "Set₆"
+    | 7 => token "Set₇"
+    | 8 => token "Set₈"
+    | 9 => token "Set₉"
+    | .succ n => app (token "Type") [lconst n]
+  else
+    match add with
+    | .succ addp =>
+      pure <| app (token "Type") [← formatLevel boundLevels.constInstance {add := addp, max := {const, params}}]
+    | .zero =>
+      pure <| app (token "Set") [← formatLevel boundLevels.constInstance {add, max := {const, params}}]
+
 def formatExprInner
   (mdatas: List MData) (e : Expr) : M PFormat := do
   try
@@ -132,30 +180,6 @@ def formatExprInner
     throw m!"in expression {e}\n{err}"
 where
   go (e : Expr) := goWithMData [] e
-
-  argName: Expr → Nat → M Name
-  | .forallE n _ _ _, .zero => pure n
-  | .forallE _ _ b _, .succ n => argName b n
-  | .mdata _ e, n => argName e n
-  | _, _ => throw m!"argument not found!"
-
-  proj (mdatas: List MData) (typeName: Name) (idx: Nat): M PFormat := do
-    let projectKeyword := (valueOf AnnotateContext).projectKeyword
-    let projId: Option Nat := mdatas.findSome? (·.get? projectKeyword)
-    let .some projId := projId | throw m!"proj without our metadata: {e} {mdatas}"
-    let projectionLevels: List Level := (valueOf AnnotationData).projectionLevels[projId]!
-
-    let env := valueOf Environment
-    let induct := env.find? typeName |>.get!
-    let .inductInfo induct := induct | throw m!"projection type is not an inductive"
-    let [ctor] := induct.ctors | throw m!"projection type is not an 1-ctor inductive"
-
-    let .ctorInfo ctor := (env.find? ctor |>.get!) | throw m!"inductive ctor is not a ctor"
-    let fieldName := ← argName ctor.type (ctor.numParams + idx)
-    let .str Name.anonymous fieldName := fieldName | throw m!"unexpected field name"
-
-    let fieldName := stringifyIdent fieldName
-    formatConst typeName projectionLevels.toArray (· ++ "." ++ fieldName) true
 
   handleAppArg (mdatas: List MData) (e: Expr): M PFormat := do
     let e <- go e
@@ -168,7 +192,7 @@ where
       goApp [] f ((← handleAppArg mdatas e) :: es)
     | .proj typeName idx e =>
       let e <- go e
-      pure <| app (← proj mdatas typeName idx) (e :: es)
+      pure <| app (← formatProj mdatas typeName idx) (e :: es)
     | .const n us =>
       pure <| app (← formatConst n us.toArray id true) es
     | .mdata m f =>
@@ -184,27 +208,7 @@ where
       let v := a[i]!
       pure <| token v
     | .sort l =>
-      let boundLevels := valueOf BoundLevels
-      let {add, max := {const, params}} := ← resolveLevel boundLevels l
-      if params.toArray.all (·.isNone) then
-        pure <| match add with
-        | 0 => token "Prop"
-        | 1 => token "Set₁"
-        | 2 => token "Set₂"
-        | 3 => token "Set₃"
-        | 4 => token "Set₄"
-        | 5 => token "Set₅"
-        | 6 => token "Set₆"
-        | 7 => token "Set₇"
-        | 8 => token "Set₈"
-        | 9 => token "Set₉"
-        | .succ n => app (token "Type") [lconst n]
-      else
-        match add with
-        | .succ addp =>
-          pure <| app (token "Type") [← formatLevel boundLevels.constInstance {add := addp, max := {const, params}}]
-        | .zero =>
-          pure <| app (token "Set") [← formatLevel boundLevels.constInstance {add, max := {const, params}}]
+      formatSort l
     | .const n us =>
       formatConst n us.toArray id true
     | .app f e =>
@@ -230,12 +234,12 @@ where
     | .fvar .. => throw m!"fvar"
     | .mvar .. => throw m!"mvar"
     | .proj t i e =>
-      pure <| app (← proj mdatas t i) [← go e]
+      pure <| app (← formatProj mdatas t i) [← go e]
     | .lit (.natVal i) => pure <| token s!"{i}"
     | .lit (.strVal s) => pure <| token s!"\"{s.escape}\""
     | .mdata m e => goWithMData (m :: mdatas) e
 
-def extractLevelParams
+private def extractLevelParams
   (levelParams: List Name) (n: Nat): M ((Array ((Option BinderInfo) × String × PFormat)) × List Name) := do
   let (a, b) <- go levelParams n
   pure (a.reverse, b)
@@ -266,6 +270,7 @@ def formatExprInnerWithLevelParams
   (levelParams: List Name) (ms: List MData) (e : Expr) : M PFormat := do
   pure <| arrow (← formatLevelParams levelParams).data (← formatExprInner ms e)
 
+@[nospecialize]
 def formatTypeParamsAndHandleExpr
   [Inhabited α] (e: Expr) (minimum: Nat) (strict: Bool) (f: List MData → Expr → M α): M ((Array ((Option BinderInfo) × String × PFormat)) × α) := do
   let (revTypeParams, expr) <- go [] e minimum
@@ -284,6 +289,7 @@ where
           throw m!"not enough type parameters in format: {num.succ} still needed of {minimum}: at {e}"
         pure (Array.empty, ← f ms e)
 
+@[nospecialize]
 def formatParamsAndHandleExpr
     [Inhabited α] (e: ProcessedExpr) (n: Nat) (strict: Bool) (f: List Name → List MData → Expr → M α): M ((Array ((Option BinderInfo) × String × PFormat)) × α) := do
   if n < e.numLevels then
@@ -301,6 +307,7 @@ def formatParamsAndProcessedExpr
     (e: ProcessedExpr) (n: Nat): M ((Array ((Option BinderInfo) × String × PFormat)) × PFormat) :=
   formatParamsAndHandleExpr e n true (formatExprInnerWithLevelParams · · ·)
 
+@[nospecialize]
 def formatArgsAndHandleExpr
     (e: ProcessedExpr) (f: List MData → Expr → Nat → M ((Array ((Option BinderInfo) × String)) × PFormat)): M ((Array ((Option BinderInfo) × String)) × PFormat) := do
   let levelParams := specializeLevelParams e.constInstance.constAnalysis e.constInstance.levelInstance e.erased.levelParams
@@ -324,6 +331,7 @@ where
       let (a, v) ← f mdatas e depth
       pure <| (a.reverse, v)
 
+@[nospecialize]
 partial def formatEagerImplicitsAndHandleExpr {α} [Inhabited α] (e: Expr) (skip: Nat)
     (f: List MData → Expr → (FormatT MetaM) ((Array ((Option BinderInfo) × String)) × α))
     : M (Array ((Option BinderInfo) × String) × α) := do
@@ -361,6 +369,7 @@ where
         throw m!"not enough type parameters when handling eager implicits: {num.succ} still needed of {skip}: at {e}"
       f ms e
 
+@[nospecialize]
 def formatArgsWithEagerImplicits
     (ty: DedupedExpr) (f: Nat → Nat) (e: ProcessedExpr) : M ((Array ((Option BinderInfo) × String)) × PFormat) := do
   formatArgsAndHandleExpr e λ ms e d ↦ do
@@ -368,6 +377,7 @@ def formatArgsWithEagerImplicits
       pure (Array.empty, ← formatExprInner ms e)
     pure <| (a, app e (a.toList.map (λ (bi, s) ↦ encloseWith (maybeLotBinderSeps bi) (token s))))
 
+@[nospecialize]
 def substTypeParams
     [Inhabited α] (mdatas: List MData) (e : Expr) (typeValues: Array String) (f: List MData → Expr → M α): M α := do
   go mdatas e typeValues.size

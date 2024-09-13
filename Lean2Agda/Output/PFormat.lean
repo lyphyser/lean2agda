@@ -6,7 +6,7 @@ open Std.Format
 
 def indentOneLevelSpaces := 2
 
-inductive Precedence
+private inductive Precedence
 | bottom
 | sect
 | whereL
@@ -35,7 +35,7 @@ inductive Precedence
 instance: LE Precedence := leOfOrd
 instance: LT Precedence := ltOfOrd
 
-def tagNoSpaces := 0
+private def tagNoSpaces := 0
 
 /-- State for formatting a pretty string. -/
 structure PrettyState where
@@ -91,14 +91,17 @@ structure PFormat where
 def format (format: Format): PFormat :=
   {precedence := .top, format}
 
-def parensGe (precedence: Precedence) (format: Format): PFormat :=
+private def parensGe (precedence: Precedence) (format: Format): PFormat :=
   { precedence, format }
 
-def resolveWithPrec (e: PFormat) (p: Precedence): Format :=
+private def resolveWithPrec (e: PFormat) (p: Precedence): Format :=
   if p >= e.precedence then
     encloseF "(" e.format ")"
   else
     e.format
+
+def resolveAtBottom (e: PFormat): Format :=
+  resolveWithPrec e .bottom
 
 def pnil: PFormat :=
   format nil
@@ -107,7 +110,7 @@ def token (s: String): PFormat :=
   format $ text s
 
 def enclose (o: Format) (f: PFormat) (c: Format): PFormat :=
-  format $ encloseF o (resolveWithPrec f .bottom) c
+  format $ encloseF o (resolveAtBottom f) c
 
 def encloseWith (s: String × String) (f: PFormat): PFormat :=
   let ⟨o, c⟩ := s
@@ -116,21 +119,21 @@ def encloseWith (s: String × String) (f: PFormat): PFormat :=
   else
     enclose (text o) f (text c)
 
-def joinN: List Format → Format
+private def joinN: List Format → Format
 | .nil => .nil
 | x :: xs => xs.foldl (·++·) x
 
-def seqGroup (behavior: FlattenBehavior): List Format → Format
+private def seqGroup (behavior: FlattenBehavior): List Format → Format
 | .nil => .nil
 | f :: .nil => f
 | f :: e :: es => group (f ++ (nest indentOneLevelSpaces (joinN $ (e :: es).map fun e => line ++ e))) behavior
 
-def seqOptNl: List Format → Format
+private def seqOptNl: List Format → Format
 | .nil => .nil
 | f :: .nil => f
 | f :: e :: es => f ++ (nest indentOneLevelSpaces (joinN $ (e :: es).map fun e => group line ++ e))
 
-def seq2 (a: Format) (b: Format): Format :=
+private def seq2 (a: Format) (b: Format): Format :=
   seqGroup .allOrNone [a, b]
 
 
@@ -140,7 +143,7 @@ def kwToken (kw: String) (e: String): PFormat :=
 def sect (kw: String) (e: PFormat): PFormat :=
   parensGe .sect $ seqGroup .allOrNone [text kw, (resolveWithPrec e .sect)]
 
-def leftAssoc (left: Precedence) (right: Precedence) (op: Format) (behavior: FlattenBehavior) (f: PFormat) (es: List PFormat): PFormat :=
+private def leftAssoc (left: Precedence) (right: Precedence) (op: Format) (behavior: FlattenBehavior) (f: PFormat) (es: List PFormat): PFormat :=
   if !es.isEmpty then
     let f := resolveWithPrec f left
     let es := es.map fun x => op ++ resolveWithPrec x right
@@ -160,7 +163,7 @@ def define (v: PFormat) (es: List PFormat): PFormat :=
 def andWhere (e: PFormat): PFormat :=
   leftAssoc .whereL .whereR "where" .fill e [token ""]
 
-def rightAssoc (left: Precedence) (right: Precedence) (op: Format) (behavior: FlattenBehavior) (es: List PFormat) (r: PFormat): PFormat :=
+private def rightAssoc (left: Precedence) (right: Precedence) (op: Format) (behavior: FlattenBehavior) (es: List PFormat) (r: PFormat): PFormat :=
   if !es.isEmpty then
     let es := es.map fun x => (resolveWithPrec x left) ++ op
     let r := resolveWithPrec r right
@@ -183,7 +186,7 @@ def typing (v: PFormat) (t: PFormat): PFormat :=
 def inExpr (es: List PFormat) (r: PFormat): PFormat :=
   rightAssoc .inL .inR " in" .fill es r
 
-def infixAssoc (opPrec: Precedence) (opPrecS: Precedence) (op: Format) (es: List PFormat): PFormat :=
+private def infixAssoc (opPrec: Precedence) (opPrecS: Precedence) (op: Format) (es: List PFormat): PFormat :=
   match es with
   | [] => pnil
   | f :: [] => f
